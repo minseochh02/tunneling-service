@@ -34,7 +34,7 @@ async def tunnel_connect(websocket: WebSocket):
     await websocket.send_json({
         "type": "connected",
         "tunnel_id": tunnel_id,
-        "public_url": f"https://your-app.onrender.com/t/{tunnel_id}"
+        "public_url": f"https://tunneling-service.onrender.com/t/{tunnel_id}"
     })
     
     try:
