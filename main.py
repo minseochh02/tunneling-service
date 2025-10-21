@@ -53,11 +53,15 @@ async def tunnel_connect(websocket: WebSocket):
                 # Handle streaming response chunks (for SSE)
                 request_id = data["request_id"]
                 if request_id in streaming_requests:
+                    print(f"📦 Received stream chunk for {request_id}: {len(data.get('body', ''))} bytes")
                     await streaming_requests[request_id].put(data)
+                else:
+                    print(f"⚠️  Received stream chunk for unknown request: {request_id}")
             
             elif data["type"] == "stream_end":
                 # End of streaming response
                 request_id = data["request_id"]
+                print(f"🏁 Received stream_end for {request_id}")
                 if request_id in streaming_requests:
                     await streaming_requests[request_id].put(None)  # Signal end
                     
@@ -96,6 +100,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     is_sse = request.method == "GET" and ("/sse" in path or path.endswith("/sse"))
     
     if is_sse:
+        print(f"🔵 Detected SSE request: {request.method} {path}")
         # Handle SSE streaming request
         stream_queue = asyncio.Queue()
         streaming_requests[request_id] = stream_queue
@@ -104,15 +109,17 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             try:
                 # Send request to client
                 await websocket.send_json(request_data)
+                print(f"📡 SSE stream started: {request_id}")
                 
-                # Stream responses as they come
+                # Stream responses as they come (indefinitely until client disconnects)
                 while True:
                     try:
-                        # Wait for chunks (with longer timeout for SSE)
-                        chunk_data = await asyncio.wait_for(stream_queue.get(), timeout=300.0)
+                        # Wait for chunks (with timeout for keepalive)
+                        chunk_data = await asyncio.wait_for(stream_queue.get(), timeout=30.0)
                         
                         if chunk_data is None:
-                            # End of stream
+                            # End of stream signal from client
+                            print(f"📡 SSE stream ended by client: {request_id}")
                             break
                         
                         # Yield the chunk body
@@ -120,15 +127,16 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                             yield chunk_data["body"]
                     
                     except asyncio.TimeoutError:
-                        # Send keepalive comment
+                        # Send keepalive comment to prevent connection timeout
                         yield ": keepalive\n\n"
                         
             except Exception as e:
-                print(f"Stream error: {e}")
+                print(f"❌ Stream error for {request_id}: {e}")
             finally:
                 # Clean up
                 if request_id in streaming_requests:
                     del streaming_requests[request_id]
+                print(f"🧹 Cleaned up stream: {request_id}")
         
         return StreamingResponse(
             stream_generator(),
