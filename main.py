@@ -1,5 +1,5 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import asyncio
 import json
 import uuid
@@ -10,6 +10,7 @@ app = FastAPI()
 # Store active tunnel connections
 active_tunnels = {}  # {tunnel_id: websocket}
 pending_requests = {}  # {request_id: asyncio.Future}
+streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 
 @app.get("/")
 async def root():
@@ -47,6 +48,18 @@ async def tunnel_connect(websocket: WebSocket):
                 if request_id in pending_requests:
                     # Resolve the pending request with response
                     pending_requests[request_id].set_result(data)
+            
+            elif data["type"] == "stream_chunk":
+                # Handle streaming response chunks (for SSE)
+                request_id = data["request_id"]
+                if request_id in streaming_requests:
+                    await streaming_requests[request_id].put(data)
+            
+            elif data["type"] == "stream_end":
+                # End of streaming response
+                request_id = data["request_id"]
+                if request_id in streaming_requests:
+                    await streaming_requests[request_id].put(None)  # Signal end
                     
     except WebSocketDisconnect:
         print(f"✗ Tunnel disconnected: {tunnel_id}")
@@ -79,37 +92,86 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         "body": body.decode() if body else None
     }
     
-    # Create a future to wait for response
-    future = asyncio.Future()
-    pending_requests[request_id] = future
+    # Check if this is an SSE request (GET to /sse endpoint)
+    is_sse = request.method == "GET" and ("/sse" in path or path.endswith("/sse"))
     
-    try:
-        # Send request to client through WebSocket
-        await websocket.send_json(request_data)
+    if is_sse:
+        # Handle SSE streaming request
+        stream_queue = asyncio.Queue()
+        streaming_requests[request_id] = stream_queue
         
-        # Wait for response (with timeout)
-        response_data = await asyncio.wait_for(future, timeout=30.0)
+        async def stream_generator():
+            try:
+                # Send request to client
+                await websocket.send_json(request_data)
+                
+                # Stream responses as they come
+                while True:
+                    try:
+                        # Wait for chunks (with longer timeout for SSE)
+                        chunk_data = await asyncio.wait_for(stream_queue.get(), timeout=300.0)
+                        
+                        if chunk_data is None:
+                            # End of stream
+                            break
+                        
+                        # Yield the chunk body
+                        if "body" in chunk_data:
+                            yield chunk_data["body"]
+                    
+                    except asyncio.TimeoutError:
+                        # Send keepalive comment
+                        yield ": keepalive\n\n"
+                        
+            except Exception as e:
+                print(f"Stream error: {e}")
+            finally:
+                # Clean up
+                if request_id in streaming_requests:
+                    del streaming_requests[request_id]
         
-        # Clean up
-        del pending_requests[request_id]
-        
-        # Return response to original requester
-        return Response(
-            content=response_data.get("body", ""),
-            status_code=response_data.get("status_code", 200),
-            headers=response_data.get("headers", {})
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "Access-Control-Allow-Origin": "*"
+            }
         )
+    
+    else:
+        # Handle regular request/response
+        future = asyncio.Future()
+        pending_requests[request_id] = future
         
-    except asyncio.TimeoutError:
-        del pending_requests[request_id]
-        return JSONResponse(
-            status_code=504,
-            content={"error": "Request timeout - client didn't respond"}
-        )
-    except Exception as e:
-        if request_id in pending_requests:
+        try:
+            # Send request to client through WebSocket
+            await websocket.send_json(request_data)
+            
+            # Wait for response (with timeout)
+            response_data = await asyncio.wait_for(future, timeout=30.0)
+            
+            # Clean up
             del pending_requests[request_id]
-        return JSONResponse(
-            status_code=500,
-            content={"error": str(e)}
-        )
+            
+            # Return response to original requester
+            return Response(
+                content=response_data.get("body", ""),
+                status_code=response_data.get("status_code", 200),
+                headers=response_data.get("headers", {})
+            )
+            
+        except asyncio.TimeoutError:
+            del pending_requests[request_id]
+            return JSONResponse(
+                status_code=504,
+                content={"error": "Request timeout - client didn't respond"}
+            )
+        except Exception as e:
+            if request_id in pending_requests:
+                del pending_requests[request_id]
+            return JSONResponse(
+                status_code=500,
+                content={"error": str(e)}
+            )
