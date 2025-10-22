@@ -222,9 +222,20 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         print(f"✗ Tunnel disconnected: {tunnel_id}")
         del active_tunnels[tunnel_id]
 
-@app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+@app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def tunnel_request(tunnel_id: str, path: str, request: Request):
     """Public endpoint - forwards requests through tunnel"""
+    
+    # Handle CORS preflight
+    if request.method == "OPTIONS":
+        return Response(
+            status_code=200,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization",
+            }
+        )
     
     if tunnel_id not in active_tunnels:
         return JSONResponse(
