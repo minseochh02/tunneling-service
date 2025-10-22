@@ -3,7 +3,22 @@ from fastapi.responses import JSONResponse, StreamingResponse
 import asyncio
 import json
 import uuid
+import os
 from datetime import datetime
+from dotenv import load_dotenv
+from supabase import create_client, Client
+
+# Load environment variables
+load_dotenv()
+
+# Initialize Supabase client
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 app = FastAPI()
 
@@ -19,6 +34,66 @@ async def root():
         "active_tunnels": len(active_tunnels),
         "instructions": "Connect client via WebSocket to /tunnel/connect"
     }
+
+@app.post("/register")
+async def register_mcp(request: Request):
+    """Register MCP client with name and IP address"""
+    try:
+        # Parse request body
+        body = await request.json()
+        name = body.get("name")
+        password = body.get("password")  # Optional password field
+        
+        if not name:
+            return JSONResponse(
+                status_code=400,
+                content={"error": "Name parameter is required"}
+            )
+        
+        # Extract IP address
+        # Try X-Forwarded-For header first (for proxied requests)
+        forwarded_for = request.headers.get("x-forwarded-for")
+        # Get the client's direct IP
+        client_host = request.client.host if request.client else None
+        
+        # Extract user agent
+        user_agent = request.headers.get("user-agent")
+        
+        # Store in Supabase
+        result = supabase.table("mcp").insert({
+            "name": name,
+            "ip": client_host,
+            "forwarded_for": forwarded_for,
+            "user_agent": user_agent,
+            "password": password
+        }).execute()
+        
+        if result.data:
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "success": True,
+                    "message": "MCP client registered successfully",
+                    "data": result.data[0]
+                }
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={"error": "Failed to register MCP client"}
+            )
+            
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=400,
+            content={"error": "Invalid JSON in request body"}
+        )
+    except Exception as e:
+        print(f"❌ Registration error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={"error": f"Registration failed: {str(e)}"}
+        )
 
 @app.websocket("/tunnel/connect")
 async def tunnel_connect(websocket: WebSocket):
