@@ -50,6 +50,19 @@ async def register_mcp(request: Request):
                 content={"error": "Name parameter is required"}
             )
         
+        # Check if name already exists
+        existing = supabase.table("mcp").select("name").eq("name", name).execute()
+        
+        if existing.data and len(existing.data) > 0:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "error": f"MCP server with name '{name}' already exists",
+                    "message": "Cannot register. This name is already taken. Please choose a different name."
+                }
+            )
+        
         # Extract IP address
         # Try X-Forwarded-For header first (for proxied requests)
         forwarded_for = request.headers.get("x-forwarded-for")
@@ -69,12 +82,16 @@ async def register_mcp(request: Request):
         }).execute()
         
         if result.data:
+            registered_data = result.data[0]
             return JSONResponse(
                 status_code=201,
                 content={
                     "success": True,
-                    "message": "MCP client registered successfully",
-                    "data": result.data[0]
+                    "message": f"MCP server '{name}' registered successfully",
+                    "name": registered_data.get("name"),
+                    "id": registered_data.get("id"),
+                    "ip": registered_data.get("ip"),
+                    "created_at": registered_data.get("created_at")
                 }
             )
         else:
@@ -96,12 +113,40 @@ async def register_mcp(request: Request):
         )
 
 @app.websocket("/tunnel/connect")
-async def tunnel_connect(websocket: WebSocket):
+async def tunnel_connect(websocket: WebSocket, name: str = None):
     """Client connects here to establish tunnel"""
     await websocket.accept()
     
-    # Generate unique tunnel ID
-    tunnel_id = str(uuid.uuid4())[:8]
+    # Use server name as tunnel identifier
+    if not name:
+        await websocket.send_json({
+            "type": "error",
+            "message": "Server name is required as query parameter"
+        })
+        await websocket.close()
+        return
+    
+    # Check if name is registered in database
+    existing = supabase.table("mcp").select("name").eq("name", name).execute()
+    if not existing.data or len(existing.data) == 0:
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Server name '{name}' is not registered"
+        })
+        await websocket.close()
+        return
+    
+    # Check if tunnel with this name already exists
+    if name in active_tunnels:
+        # Close existing connection
+        old_ws = active_tunnels[name]
+        try:
+            await old_ws.close()
+        except:
+            pass
+        print(f"⚠️  Replacing existing tunnel: {name}")
+    
+    tunnel_id = name
     active_tunnels[tunnel_id] = websocket
     
     print(f"✓ Tunnel established: {tunnel_id}")
