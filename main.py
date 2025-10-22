@@ -50,19 +50,6 @@ async def register_mcp(request: Request):
                 content={"error": "Name parameter is required"}
             )
         
-        # Check if name already exists
-        existing = supabase.table("mcp").select("name").eq("name", name).execute()
-        
-        if existing.data and len(existing.data) > 0:
-            return JSONResponse(
-                status_code=409,
-                content={
-                    "success": False,
-                    "error": f"MCP server with name '{name}' already exists",
-                    "message": "Cannot register. This name is already taken. Please choose a different name."
-                }
-            )
-        
         # Extract IP address
         # Try X-Forwarded-For header first (for proxied requests)
         forwarded_for = request.headers.get("x-forwarded-for")
@@ -72,7 +59,52 @@ async def register_mcp(request: Request):
         # Extract user agent
         user_agent = request.headers.get("user-agent")
         
-        # Store in Supabase
+        # Check if name already exists
+        existing = supabase.table("mcp").select("*").eq("name", name).execute()
+        
+        if existing.data and len(existing.data) > 0:
+            existing_record = existing.data[0]
+            existing_ip = existing_record.get("ip")
+            
+            # Check if it's the same IP (owner trying to re-register)
+            if existing_ip == client_host:
+                # Same IP - update the record and allow re-registration
+                update_result = supabase.table("mcp").update({
+                    "updated_at": datetime.now().isoformat(),
+                    "forwarded_for": forwarded_for,
+                    "user_agent": user_agent,
+                    "password": password
+                }).eq("name", name).execute()
+                
+                if update_result.data:
+                    updated_data = update_result.data[0]
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "success": True,
+                            "message": f"MCP server '{name}' re-registered successfully (same owner)",
+                            "name": updated_data.get("name"),
+                            "id": updated_data.get("id"),
+                            "ip": updated_data.get("ip"),
+                            "created_at": updated_data.get("created_at"),
+                            "updated_at": updated_data.get("updated_at"),
+                            "is_reregistration": True
+                        }
+                    )
+            else:
+                # Different IP - name is taken by someone else
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "success": False,
+                        "error": f"MCP server with name '{name}' already exists",
+                        "message": "Cannot register. This name is already taken by a different IP address. Please choose a different name.",
+                        "existing_ip": existing_ip,
+                        "your_ip": client_host
+                    }
+                )
+        
+        # Name doesn't exist - create new registration
         result = supabase.table("mcp").insert({
             "name": name,
             "ip": client_host,
@@ -91,7 +123,8 @@ async def register_mcp(request: Request):
                     "name": registered_data.get("name"),
                     "id": registered_data.get("id"),
                     "ip": registered_data.get("ip"),
-                    "created_at": registered_data.get("created_at")
+                    "created_at": registered_data.get("created_at"),
+                    "is_reregistration": False
                 }
             )
         else:
