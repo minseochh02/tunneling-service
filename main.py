@@ -37,44 +37,52 @@ async def root():
 
 @app.post("/register")
 async def register_mcp(request: Request):
-    """Register MCP client with name and IP address"""
+    """Register MCP server - IP-based, no authentication required"""
     try:
         # Parse request body
         body = await request.json()
         name = body.get("name")
-        password = body.get("password")  # Optional password field
+        server_key = body.get("server_key")
+        description = body.get("description")
+        connection_url = body.get("connection_url")
+        max_concurrent_connections = body.get("max_concurrent_connections", 10)
         
-        if not name:
+        if not name or not server_key:
             return JSONResponse(
                 status_code=400,
-                content={"error": "Name parameter is required"}
+                content={
+                    "success": False,
+                    "error": "Missing required fields",
+                    "message": "Both name and server_key are required"
+                }
             )
         
-        # Extract IP address
-        # Try X-Forwarded-For header first (for proxied requests)
+        # Extract IP information
         forwarded_for = request.headers.get("x-forwarded-for")
-        # Get the client's direct IP
+        real_ip = request.headers.get("x-real-ip")
         client_host = request.client.host if request.client else None
         
-        # Extract user agent
-        user_agent = request.headers.get("user-agent")
+        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
+        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
         
-        # Check if name already exists
-        existing = supabase.table("mcp").select("*").eq("name", name).execute()
+        # Check if server_key is already taken
+        existing = supabase.table("mcp_servers").select("id, name, server_key, owner_ip, created_at").eq("server_key", server_key).execute()
         
         if existing.data and len(existing.data) > 0:
             existing_record = existing.data[0]
-            existing_ip = existing_record.get("ip")
+            existing_ip = existing_record.get("owner_ip")
             
-            # Check if it's the same IP (owner trying to re-register)
-            if existing_ip == client_host:
-                # Same IP - update the record and allow re-registration
-                update_result = supabase.table("mcp").update({
+            # Check if it's the same IP (owner trying to re-register/update)
+            if existing_ip == client_ip:
+                # Same IP - update the record
+                update_result = supabase.table("mcp_servers").update({
+                    "name": name,
+                    "description": description,
+                    "connection_url": connection_url,
+                    "max_concurrent_connections": max_concurrent_connections,
                     "updated_at": datetime.now().isoformat(),
-                    "forwarded_for": forwarded_for,
-                    "user_agent": user_agent,
-                    "password": password
-                }).eq("name", name).execute()
+                    "status": "active"
+                }).eq("server_key", server_key).execute()
                 
                 if update_result.data:
                     updated_data = update_result.data[0]
@@ -82,47 +90,54 @@ async def register_mcp(request: Request):
                         status_code=200,
                         content={
                             "success": True,
-                            "message": f"MCP server '{name}' re-registered successfully (same owner)",
+                            "message": f"MCP server '{name}' re-registered successfully",
                             "name": updated_data.get("name"),
                             "id": updated_data.get("id"),
-                            "ip": updated_data.get("ip"),
+                            "server_key": updated_data.get("server_key"),
+                            "ip": client_ip,
                             "created_at": updated_data.get("created_at"),
-                            "updated_at": updated_data.get("updated_at"),
                             "is_reregistration": True
                         }
                     )
             else:
-                # Different IP - name is taken by someone else
+                # Different IP - server key taken by someone else
                 return JSONResponse(
                     status_code=409,
                     content={
                         "success": False,
-                        "error": f"MCP server with name '{name}' already exists",
-                        "message": "Cannot register. This name is already taken by a different IP address. Please choose a different name.",
-                        "existing_ip": existing_ip,
-                        "your_ip": client_host
+                        "error": "Server key already exists",
+                        "message": f"Server key '{server_key}' is already registered by a different IP address",
+                        "existing_record": {
+                            "name": existing_record.get("name"),
+                            "server_key": existing_record.get("server_key"),
+                            "registered_at": existing_record.get("created_at")
+                        }
                     }
                 )
         
-        # Name doesn't exist - create new registration
-        result = supabase.table("mcp").insert({
+        # Server key doesn't exist - create new registration
+        result = supabase.table("mcp_servers").insert({
+            "owner_ip": client_ip,
+            "owner_id": None,  # Optional: can be linked later via OAuth
             "name": name,
-            "ip": client_host,
-            "forwarded_for": forwarded_for,
-            "user_agent": user_agent,
-            "password": password
+            "description": description,
+            "server_key": server_key,
+            "connection_url": connection_url,
+            "max_concurrent_connections": max_concurrent_connections,
+            "status": "active"
         }).execute()
         
-        if result.data:
+        if result.data and len(result.data) > 0:
             registered_data = result.data[0]
             return JSONResponse(
                 status_code=201,
                 content={
                     "success": True,
-                    "message": f"MCP server '{name}' registered successfully",
+                    "message": "MCP server registered successfully",
                     "name": registered_data.get("name"),
                     "id": registered_data.get("id"),
-                    "ip": registered_data.get("ip"),
+                    "server_key": registered_data.get("server_key"),
+                    "ip": client_ip,
                     "created_at": registered_data.get("created_at"),
                     "is_reregistration": False
                 }
@@ -130,19 +145,31 @@ async def register_mcp(request: Request):
         else:
             return JSONResponse(
                 status_code=500,
-                content={"error": "Failed to register MCP client"}
+                content={
+                    "success": False,
+                    "error": "Database error",
+                    "message": "Failed to register MCP server"
+                }
             )
             
     except json.JSONDecodeError:
         return JSONResponse(
             status_code=400,
-            content={"error": "Invalid JSON in request body"}
+            content={
+                "success": False,
+                "error": "Invalid JSON",
+                "message": "Invalid JSON in request body"
+            }
         )
     except Exception as e:
         print(f"❌ Registration error: {e}")
         return JSONResponse(
             status_code=500,
-            content={"error": f"Registration failed: {str(e)}"}
+            content={
+                "success": False,
+                "error": "Internal server error",
+                "message": str(e)
+            }
         )
 
 @app.websocket("/tunnel/connect")
@@ -159,30 +186,45 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         await websocket.close()
         return
     
-    # Check if name is registered in database
-    existing = supabase.table("mcp").select("name").eq("name", name).execute()
+    # Check if server is registered in mcp_servers table (check by server_key or name)
+    # Try server_key first, then fallback to name for backwards compatibility
+    existing = supabase.table("mcp_servers").select("id, name, server_key, status").or_(f"server_key.eq.{name},name.eq.{name}").execute()
+    
     if not existing.data or len(existing.data) == 0:
         await websocket.send_json({
             "type": "error",
-            "message": f"Server name '{name}' is not registered"
+            "message": f"Server '{name}' is not registered. Please register first."
         })
         await websocket.close()
         return
     
-    # Check if tunnel with this name already exists
-    if name in active_tunnels:
+    server_data = existing.data[0]
+    
+    # Check if server is active
+    if server_data.get("status") != "active":
+        await websocket.send_json({
+            "type": "error",
+            "message": f"Server '{name}' is not active (status: {server_data.get('status')})"
+        })
+        await websocket.close()
+        return
+    
+    # Use server_key as tunnel_id if available, otherwise use name
+    tunnel_id = server_data.get("server_key") or name
+    
+    # Check if tunnel with this ID already exists
+    if tunnel_id in active_tunnels:
         # Close existing connection
-        old_ws = active_tunnels[name]
+        old_ws = active_tunnels[tunnel_id]
         try:
             await old_ws.close()
         except:
             pass
-        print(f"⚠️  Replacing existing tunnel: {name}")
+        print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
     
-    tunnel_id = name
     active_tunnels[tunnel_id] = websocket
     
-    print(f"✓ Tunnel established: {tunnel_id}")
+    print(f"✓ Tunnel established: {tunnel_id} (server: {server_data.get('name')})")
     
     # Send tunnel info to client
     await websocket.send_json({
