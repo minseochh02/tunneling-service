@@ -172,6 +172,350 @@ async def register_mcp(request: Request):
             }
         )
 
+@app.post("/permissions")
+async def add_permissions(request: Request):
+    """Add allowed email(s) to server - IP-based authentication"""
+    try:
+        # Extract client IP
+        forwarded_for = request.headers.get("x-forwarded-for")
+        real_ip = request.headers.get("x-real-ip")
+        client_host = request.client.host if request.client else None
+        
+        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
+        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
+        
+        # Parse request body
+        body = await request.json()
+        server_key = body.get("server_key")
+        emails = body.get("emails", [])
+        access_level = body.get("access_level", "read_write")
+        expires_at = body.get("expires_at")
+        notes = body.get("notes")
+        
+        if not server_key or not emails:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": "Missing required fields",
+                    "message": "server_key and emails are required"
+                }
+            )
+        
+        # Verify server exists and IP matches
+        server = supabase.table("mcp_servers").select("*").eq("server_key", server_key).single().execute()
+        
+        if not server.data:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "error": "Server not found",
+                    "message": f"Server '{server_key}' does not exist"
+                }
+            )
+        
+        if server.data.get("owner_ip") != client_ip:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "success": False,
+                    "error": "Permission denied",
+                    "message": "Your IP does not match the server owner's IP"
+                }
+            )
+        
+        # Add permissions for each email
+        permissions_to_add = []
+        for email in emails:
+            permissions_to_add.append({
+                "server_id": server.data["id"],
+                "allowed_email": email.lower(),  # Store lowercase
+                "status": "pending",
+                "access_level": access_level,
+                "granted_by_ip": client_ip,
+                "expires_at": expires_at,
+                "notes": notes
+            })
+        
+        result = supabase.table("mcp_server_permissions").insert(permissions_to_add).execute()
+        
+        if result.data:
+            return JSONResponse(
+                status_code=201,
+                content={
+                    "success": True,
+                    "message": f"Added {len(result.data)} permission(s)",
+                    "added": len(result.data),
+                    "permissions": result.data
+                }
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "error": "Database error",
+                    "message": "Failed to add permissions"
+                }
+            )
+            
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error": "Invalid JSON",
+                "message": "Invalid JSON in request body"
+            }
+        )
+    except Exception as e:
+        print(f"❌ Add permissions error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": "Internal server error",
+                "message": str(e)
+            }
+        )
+
+@app.get("/permissions/{server_key}")
+async def get_permissions(server_key: str, request: Request):
+    """Get all permissions for a server - IP-based authentication"""
+    try:
+        # Extract client IP
+        forwarded_for = request.headers.get("x-forwarded-for")
+        real_ip = request.headers.get("x-real-ip")
+        client_host = request.client.host if request.client else None
+        
+        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
+        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
+        
+        # Verify server exists and IP matches
+        server = supabase.table("mcp_servers").select("*").eq("server_key", server_key).single().execute()
+        
+        if not server.data:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "error": "Server not found",
+                    "message": f"Server '{server_key}' does not exist"
+                }
+            )
+        
+        if server.data.get("owner_ip") != client_ip:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "success": False,
+                    "error": "Permission denied",
+                    "message": "Your IP does not match the server owner's IP"
+                }
+            )
+        
+        # Get all permissions for this server
+        permissions = supabase.table("mcp_server_permissions").select("*").eq("server_id", server.data["id"]).execute()
+        
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "server_key": server_key,
+                "permissions": permissions.data or []
+            }
+        )
+        
+    except Exception as e:
+        print(f"❌ Get permissions error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": "Internal server error",
+                "message": str(e)
+            }
+        )
+
+@app.patch("/permissions/{permission_id}")
+async def update_permission(permission_id: str, request: Request):
+    """Update a permission - IP-based authentication"""
+    try:
+        # Extract client IP
+        forwarded_for = request.headers.get("x-forwarded-for")
+        real_ip = request.headers.get("x-real-ip")
+        client_host = request.client.host if request.client else None
+        
+        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
+        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
+        
+        # Get permission and verify ownership
+        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_ip)").eq("id", permission_id).single().execute()
+        
+        if not permission.data:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "error": "Permission not found",
+                    "message": f"Permission '{permission_id}' does not exist"
+                }
+            )
+        
+        if permission.data["mcp_servers"]["owner_ip"] != client_ip:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "success": False,
+                    "error": "Permission denied",
+                    "message": "Your IP does not match the server owner's IP"
+                }
+            )
+        
+        # Parse update fields
+        body = await request.json()
+        update_fields = {}
+        
+        if "access_level" in body:
+            update_fields["access_level"] = body["access_level"]
+        if "expires_at" in body:
+            update_fields["expires_at"] = body["expires_at"]
+        if "notes" in body:
+            update_fields["notes"] = body["notes"]
+        if "status" in body:
+            update_fields["status"] = body["status"]
+            if body["status"] == "revoked":
+                update_fields["revoked_at"] = datetime.now().isoformat()
+        
+        if not update_fields:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": "No update fields",
+                    "message": "No fields to update"
+                }
+            )
+        
+        # Update permission
+        result = supabase.table("mcp_server_permissions").update(update_fields).eq("id", permission_id).execute()
+        
+        if result.data:
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": "Permission updated",
+                    "permission": result.data[0]
+                }
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "error": "Database error",
+                    "message": "Failed to update permission"
+                }
+            )
+            
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error": "Invalid JSON",
+                "message": "Invalid JSON in request body"
+            }
+        )
+    except Exception as e:
+        print(f"❌ Update permission error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": "Internal server error",
+                "message": str(e)
+            }
+        )
+
+@app.delete("/permissions/{permission_id}")
+async def delete_permission(permission_id: str, request: Request):
+    """Revoke a permission - IP-based authentication"""
+    try:
+        # Extract client IP
+        forwarded_for = request.headers.get("x-forwarded-for")
+        real_ip = request.headers.get("x-real-ip")
+        client_host = request.client.host if request.client else None
+        
+        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
+        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
+        
+        # Get permission and verify ownership
+        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_ip)").eq("id", permission_id).single().execute()
+        
+        if not permission.data:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "error": "Permission not found",
+                    "message": f"Permission '{permission_id}' does not exist"
+                }
+            )
+        
+        if permission.data["mcp_servers"]["owner_ip"] != client_ip:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "success": False,
+                    "error": "Permission denied",
+                    "message": "Your IP does not match the server owner's IP"
+                }
+            )
+        
+        # Soft delete: mark as revoked instead of actually deleting
+        result = supabase.table("mcp_server_permissions").update({
+            "status": "revoked",
+            "revoked_at": datetime.now().isoformat()
+        }).eq("id", permission_id).execute()
+        
+        if result.data:
+            # Also terminate any active sessions for this permission
+            supabase.table("mcp_connection_sessions").update({
+                "status": "terminated",
+                "disconnected_at": datetime.now().isoformat()
+            }).eq("permission_id", permission_id).eq("status", "active").execute()
+            
+            return JSONResponse(
+                status_code=200,
+                content={
+                    "success": True,
+                    "message": "Permission revoked and active sessions terminated"
+                }
+            )
+        else:
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "success": False,
+                    "error": "Database error",
+                    "message": "Failed to revoke permission"
+                }
+            )
+            
+    except Exception as e:
+        print(f"❌ Delete permission error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": "Internal server error",
+                "message": str(e)
+            }
+        )
+
 @app.websocket("/tunnel/connect")
 async def tunnel_connect(websocket: WebSocket, name: str = None):
     """Client connects here to establish tunnel"""
