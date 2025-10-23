@@ -635,28 +635,13 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     # Read request body
     body = await request.body()
     
-    # Prepare headers to forward (with tunnel-specific headers)
-    forwarded_headers = dict(request.headers)
-    
-    # Add tunnel identification header
-    forwarded_headers["X-Forwarded-By-Tunnel"] = "true"
-    forwarded_headers["X-Tunnel-Server-Key"] = tunnel_id
-    
-    # TODO: OAuth integration (Phase 4)
-    # For now, we mark requests as coming through tunnel
-    # Later, we'll add:
-    # - OAuth middleware to authenticate the remote user
-    # - Check permissions in mcp_server_permissions table
-    # - Add X-Tunnel-User-Email header with authenticated email
-    # - Add X-Tunnel-User-Id header with authenticated user ID
-    
     # Prepare request data to send to client
     request_data = {
         "type": "request",
         "request_id": request_id,
         "method": request.method,
         "path": "/" + path,
-        "headers": forwarded_headers,
+        "headers": dict(request.headers),
         "query_params": dict(request.query_params),
         "body": body.decode() if body else None
     }
