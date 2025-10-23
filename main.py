@@ -623,6 +623,63 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         print(f"✗ Tunnel disconnected: {tunnel_id}")
         del active_tunnels[tunnel_id]
 
+@app.get("/t/{tunnel_id}/ping")
+async def ping_server(tunnel_id: str, request: Request):
+    """Health check endpoint - verifies if server is online and accessible"""
+    
+    # Extract Authorization header for authentication
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "Unauthorized",
+                "message": "Missing or invalid Authorization header"
+            }
+        )
+    
+    # Verify token (basic check, not full permission validation for health check)
+    access_token = auth_header.replace("Bearer ", "")
+    try:
+        user_response = supabase.auth.get_user(access_token)
+        if not user_response or not user_response.user:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "message": "Invalid or expired access token"
+                }
+            )
+    except Exception as e:
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "Authentication failed",
+                "message": str(e)
+            }
+        )
+    
+    # Check if tunnel exists and is connected
+    if tunnel_id not in active_tunnels:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "online": False,
+                "error": "Server offline or not connected"
+            }
+        )
+    
+    # Server is online
+    from datetime import datetime as dt
+    return JSONResponse(
+        status_code=200,
+        content={
+            "online": True,
+            "server_key": tunnel_id,
+            "timestamp": dt.utcnow().isoformat()
+        }
+    )
+
 @app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def tunnel_request(tunnel_id: str, path: str, request: Request):
     """Public endpoint - forwards requests through tunnel with OAuth authentication"""
