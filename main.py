@@ -824,16 +824,21 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             session_id = existing_session.data[0]["id"]
             supabase.table("mcp_connection_sessions").update({
                 "last_activity_at": datetime.utcnow().isoformat(),
-                "request_count": existing_session.data[0]["request_count"] + 1
+                "requests_count": existing_session.data[0]["requests_count"] + 1
             }).eq("id", session_id).execute()
         else:
             # Create new session
+            import secrets
+            session_token = secrets.token_urlsafe(32)
             supabase.table("mcp_connection_sessions").insert({
+                "server_id": server_id,
+                "user_id": user_id,
                 "permission_id": permission.data["id"],
+                "session_token": session_token,
                 "status": "active",
                 "connected_at": datetime.utcnow().isoformat(),
                 "last_activity_at": datetime.utcnow().isoformat(),
-                "request_count": 1
+                "requests_count": 1
             }).execute()
         
         print(f"✅ Authorization granted for {user_email} to access {tunnel_id}")
