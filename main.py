@@ -47,6 +47,7 @@ async def root():
     return {
         "service": "Tunnel Service",
         "active_tunnels": len(active_tunnels),
+        "tunnel_ids": list(active_tunnels.keys()),
         "instructions": "Connect client via WebSocket to /tunnel/connect"
     }
 
@@ -627,6 +628,9 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
 async def ping_server(tunnel_id: str, request: Request):
     """Health check endpoint - verifies if server is online and accessible"""
     
+    print(f"🏓 Ping request for tunnel: {tunnel_id}")
+    print(f"📊 Active tunnels: {list(active_tunnels.keys())}")
+    
     # Extract Authorization header for authentication
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -661,15 +665,18 @@ async def ping_server(tunnel_id: str, request: Request):
     
     # Check if tunnel exists and is connected
     if tunnel_id not in active_tunnels:
+        print(f"❌ Tunnel '{tunnel_id}' not found in active tunnels")
         return JSONResponse(
             status_code=503,
             content={
                 "online": False,
-                "error": "Server offline or not connected"
+                "error": "Server offline or not connected",
+                "active_tunnels": list(active_tunnels.keys())
             }
         )
     
     # Server is online
+    print(f"✅ Tunnel '{tunnel_id}' is online")
     from datetime import datetime as dt
     return JSONResponse(
         status_code=200,
