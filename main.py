@@ -794,7 +794,6 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         # Check expiration date
         expires_at = permission.data.get("expires_at")
         if expires_at:
-            from datetime import datetime
             expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
             if datetime.now(expiry.tzinfo) > expiry:
                 # Auto-expire the permission
