@@ -593,6 +593,23 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         "public_url": f"https://tunneling-service.onrender.com/t/{tunnel_id}"
     })
     
+    # Heartbeat task to keep connection alive and detect disconnections
+    async def heartbeat():
+        """Send periodic pings to detect connection health"""
+        try:
+            while True:
+                await asyncio.sleep(30)  # Ping every 30 seconds
+                try:
+                    await websocket.send_json({"type": "ping", "timestamp": datetime.now().isoformat()})
+                except Exception as e:
+                    print(f"💔 Heartbeat failed for {tunnel_id}: {e}")
+                    break
+        except asyncio.CancelledError:
+            pass
+    
+    # Start heartbeat task
+    heartbeat_task = asyncio.create_task(heartbeat())
+    
     try:
         # Listen for responses from client
         while True:
@@ -619,10 +636,28 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
                 print(f"🏁 Received stream_end for {request_id}")
                 if request_id in streaming_requests:
                     await streaming_requests[request_id].put(None)  # Signal end
+            
+            elif data["type"] == "pong":
+                # Client responded to ping - connection is healthy
+                print(f"💓 Heartbeat acknowledged for {tunnel_id}")
                     
     except WebSocketDisconnect:
         print(f"✗ Tunnel disconnected: {tunnel_id}")
-        del active_tunnels[tunnel_id]
+    except Exception as e:
+        print(f"✗ Tunnel error for {tunnel_id}: {e}")
+    finally:
+        # Clean up
+        heartbeat_task.cancel()
+        if tunnel_id in active_tunnels:
+            del active_tunnels[tunnel_id]
+        
+        # Clean up any pending streaming requests for this tunnel
+        dead_streams = [req_id for req_id, queue in streaming_requests.items() if req_id.startswith(tunnel_id)]
+        for req_id in dead_streams:
+            streaming_requests[req_id].put_nowait(None)
+            del streaming_requests[req_id]
+        
+        print(f"🧹 Cleaned up tunnel: {tunnel_id}")
 
 @app.get("/t/{tunnel_id}/ping")
 async def ping_server(tunnel_id: str, request: Request):
@@ -883,6 +918,9 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         stream_queue = asyncio.Queue()
         streaming_requests[request_id] = stream_queue
         
+        # Track if client disconnected
+        client_disconnected = asyncio.Event()
+        
         async def stream_generator():
             try:
                 # Send request to client
@@ -890,14 +928,14 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                 print(f"📡 SSE stream started: {request_id}")
                 
                 # Stream responses as they come (indefinitely until client disconnects)
-                while True:
+                while not client_disconnected.is_set():
                     try:
                         # Wait for chunks (with timeout for keepalive)
                         chunk_data = await asyncio.wait_for(stream_queue.get(), timeout=30.0)
                         
                         if chunk_data is None:
                             # End of stream signal from client
-                            print(f"📡 SSE stream ended by client: {request_id}")
+                            print(f"📡 SSE stream ended by server: {request_id}")
                             break
                         
                         # Yield the chunk body
@@ -908,6 +946,20 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                         # Send keepalive comment to prevent connection timeout
                         yield ": keepalive\n\n"
                         
+            except asyncio.CancelledError:
+                # Client disconnected - this is raised when the HTTP connection closes
+                print(f"🔌 SSE client disconnected: {request_id}")
+                client_disconnected.set()
+                
+                # Notify tunnel client to stop streaming
+                try:
+                    await websocket.send_json({
+                        "type": "stream_cancel",
+                        "request_id": request_id
+                    })
+                except:
+                    pass
+                    
             except Exception as e:
                 print(f"❌ Stream error for {request_id}: {e}")
             finally:
