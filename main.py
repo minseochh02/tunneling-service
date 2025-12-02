@@ -5,6 +5,7 @@ import asyncio
 import json
 import uuid
 import os
+import hashlib
 from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -41,6 +42,20 @@ app.add_middleware(
 active_tunnels = {}  # {tunnel_id: websocket}
 pending_requests = {}  # {request_id: asyncio.Future}
 streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
+
+def verify_ip_ownership(client_ip: str, stored_ip_hash: str, stored_salt: str = None) -> bool:
+    """
+    Verify that the client IP matches the stored owner IP.
+    Supports both legacy (plain IP) and new (hashed IP with salt) formats.
+    """
+    if not stored_salt:
+        # Legacy: direct comparison
+        return stored_ip_hash == client_ip
+    else:
+        # New: hash the client IP with the stored salt and compare
+        combined = (client_ip + stored_salt).encode('utf-8')
+        computed_hash = hashlib.sha256(combined).hexdigest()
+        return computed_hash == stored_ip_hash
 
 @app.get("/")
 async def root():
@@ -82,14 +97,15 @@ async def register_mcp(request: Request):
         client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
         
         # Check if server_key is already taken
-        existing = supabase.table("mcp_servers").select("id, name, server_key, owner_ip, created_at").eq("server_key", server_key).execute()
+        existing = supabase.table("mcp_servers").select("id, name, server_key, owner_ip, owner_ip_salt, created_at").eq("server_key", server_key).execute()
         
         if existing.data and len(existing.data) > 0:
             existing_record = existing.data[0]
-            existing_ip = existing_record.get("owner_ip")
+            existing_ip_hash = existing_record.get("owner_ip")
+            existing_salt = existing_record.get("owner_ip_salt")
             
             # Check if it's the same IP (owner trying to re-register/update)
-            if existing_ip == client_ip:
+            if verify_ip_ownership(client_ip, existing_ip_hash, existing_salt):
                 # Same IP - update the record
                 update_result = supabase.table("mcp_servers").update({
                     "name": name,
@@ -132,8 +148,14 @@ async def register_mcp(request: Request):
                 )
         
         # Server key doesn't exist - create new registration
+        # Hash the IP with a random salt (matches Supabase Edge Function logic)
+        ip_salt = os.urandom(16).hex()  # 16 bytes = 32 hex chars
+        combined = (client_ip + ip_salt).encode('utf-8')
+        ip_hash = hashlib.sha256(combined).hexdigest()
+        
         result = supabase.table("mcp_servers").insert({
-            "owner_ip": client_ip,
+            "owner_ip": ip_hash,
+            "owner_ip_salt": ip_salt,
             "owner_id": None,  # Optional: can be linked later via OAuth
             "name": name,
             "description": description,
@@ -231,7 +253,11 @@ async def add_permissions(request: Request):
                 }
             )
         
-        if server.data.get("owner_ip") != client_ip:
+        # Verify IP ownership using hash+salt
+        stored_ip_hash = server.data.get("owner_ip")
+        stored_salt = server.data.get("owner_ip_salt")
+        
+        if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
             return JSONResponse(
                 status_code=403,
                 content={
@@ -321,7 +347,11 @@ async def get_permissions(server_key: str, request: Request):
                 }
             )
         
-        if server.data.get("owner_ip") != client_ip:
+        # Verify IP ownership using hash+salt
+        stored_ip_hash = server.data.get("owner_ip")
+        stored_salt = server.data.get("owner_ip_salt")
+        
+        if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
             return JSONResponse(
                 status_code=403,
                 content={
@@ -367,7 +397,7 @@ async def update_permission(permission_id: str, request: Request):
         client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
         
         # Get permission and verify ownership
-        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_ip)").eq("id", permission_id).single().execute()
+        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_ip, owner_ip_salt)").eq("id", permission_id).single().execute()
         
         if not permission.data:
             return JSONResponse(
@@ -379,7 +409,11 @@ async def update_permission(permission_id: str, request: Request):
                 }
             )
         
-        if permission.data["mcp_servers"]["owner_ip"] != client_ip:
+        # Verify IP ownership using hash+salt
+        stored_ip_hash = permission.data["mcp_servers"]["owner_ip"]
+        stored_salt = permission.data["mcp_servers"].get("owner_ip_salt")
+        
+        if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
             return JSONResponse(
                 status_code=403,
                 content={
@@ -469,7 +503,7 @@ async def delete_permission(permission_id: str, request: Request):
         client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
         
         # Get permission and verify ownership
-        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_ip)").eq("id", permission_id).single().execute()
+        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_ip, owner_ip_salt)").eq("id", permission_id).single().execute()
         
         if not permission.data:
             return JSONResponse(
@@ -481,7 +515,11 @@ async def delete_permission(permission_id: str, request: Request):
                 }
             )
         
-        if permission.data["mcp_servers"]["owner_ip"] != client_ip:
+        # Verify IP ownership using hash+salt
+        stored_ip_hash = permission.data["mcp_servers"]["owner_ip"]
+        stored_salt = permission.data["mcp_servers"].get("owner_ip_salt")
+        
+        if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
             return JSONResponse(
                 status_code=403,
                 content={
