@@ -586,7 +586,8 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
     
     # Check if server is registered in mcp_servers table (check by server_key or name)
     # Try server_key first, then fallback to name for backwards compatibility
-    existing = supabase.table("mcp_servers").select("id, name, server_key, status").or_(f"server_key.eq.{name},name.eq.{name}").execute()
+    # Include owner_ip and owner_ip_salt for IP verification
+    existing = supabase.table("mcp_servers").select("id, name, server_key, status, owner_ip, owner_ip_salt").or_(f"server_key.eq.{name},name.eq.{name}").execute()
     
     if not existing.data or len(existing.data) == 0:
         await websocket.send_json({
@@ -603,6 +604,33 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         await websocket.send_json({
             "type": "error",
             "message": f"Server '{name}' is not active (status: {server_data.get('status')})"
+        })
+        await websocket.close()
+        return
+    
+    # Verify IP ownership - get client IP from WebSocket connection
+    # Note: For WebSocket, we need to extract IP from the scope
+    client_ip = None
+    if websocket.scope.get("client"):
+        client_ip = websocket.scope["client"][0]
+    
+    # Also check headers for proxied connections
+    headers = dict(websocket.scope.get("headers", []))
+    forwarded_for = headers.get(b"x-forwarded-for", b"").decode()
+    real_ip = headers.get(b"x-real-ip", b"").decode()
+    
+    # Prioritize real-ip, then forwarded-for, then direct client IP
+    client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_ip or "unknown"
+    
+    # Verify IP ownership using hash+salt
+    stored_ip_hash = server_data.get("owner_ip")
+    stored_salt = server_data.get("owner_ip_salt")
+    
+    if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
+        print(f"❌ IP verification failed for tunnel '{name}': client_ip={client_ip}")
+        await websocket.send_json({
+            "type": "error",
+            "message": f"IP verification failed. Your IP does not match the registered owner's IP for server '{name}'."
         })
         await websocket.close()
         return
