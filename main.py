@@ -77,6 +77,7 @@ async def register_mcp(request: Request):
         description = body.get("description")
         connection_url = body.get("connection_url")
         max_concurrent_connections = body.get("max_concurrent_connections", 10)
+        owner_email = body.get("owner_email")  # Optional: auto-add as invited user
         
         if not name or not server_key:
             return JSONResponse(
@@ -118,6 +119,37 @@ async def register_mcp(request: Request):
                 
                 if update_result.data:
                     updated_data = update_result.data[0]
+                    server_id = updated_data.get("id")
+                    
+                    # Auto-add owner permission if email was provided (handles case where owner wasn't added before)
+                    owner_permission_added = False
+                    if owner_email and server_id:
+                        try:
+                            # Check if permission already exists
+                            existing_perm = supabase.table("mcp_server_permissions").select("id").eq("server_id", server_id).eq("allowed_email", owner_email.lower()).execute()
+                            
+                            if not existing_perm.data or len(existing_perm.data) == 0:
+                                # Permission doesn't exist, create it
+                                perm_result = supabase.table("mcp_server_permissions").insert({
+                                    "server_id": server_id,
+                                    "allowed_email": owner_email.lower(),
+                                    "status": "active",
+                                    "access_level": "admin",
+                                    "granted_at": datetime.now().isoformat(),
+                                    "activated_at": datetime.now().isoformat(),
+                                    "notes": "Auto-granted: Server owner (re-registration)"
+                                }).execute()
+                                
+                                if perm_result.data:
+                                    owner_permission_added = True
+                                    print(f"✅ Auto-added owner permission for {owner_email} (re-registration)")
+                            else:
+                                # Permission already exists
+                                owner_permission_added = True
+                                print(f"ℹ️ Owner permission already exists for {owner_email}")
+                        except Exception as perm_error:
+                            print(f"⚠️ Warning: Failed to handle owner permission on re-registration: {perm_error}")
+                    
                     return JSONResponse(
                         status_code=200,
                         content={
@@ -128,7 +160,8 @@ async def register_mcp(request: Request):
                             "server_key": updated_data.get("server_key"),
                             "ip": client_ip,
                             "created_at": updated_data.get("created_at"),
-                            "is_reregistration": True
+                            "is_reregistration": True,
+                            "owner_permission_added": owner_permission_added
                         }
                     )
             else:
@@ -167,6 +200,29 @@ async def register_mcp(request: Request):
         
         if result.data and len(result.data) > 0:
             registered_data = result.data[0]
+            server_id = registered_data.get("id")
+            
+            # Auto-add owner permission if email was provided
+            owner_permission_added = False
+            if owner_email and server_id:
+                try:
+                    perm_result = supabase.table("mcp_server_permissions").insert({
+                        "server_id": server_id,
+                        "allowed_email": owner_email.lower(),
+                        "status": "active",
+                        "access_level": "admin",
+                        "granted_at": datetime.now().isoformat(),
+                        "activated_at": datetime.now().isoformat(),
+                        "notes": "Auto-granted: Server owner"
+                    }).execute()
+                    
+                    if perm_result.data:
+                        owner_permission_added = True
+                        print(f"✅ Auto-added owner permission for {owner_email}")
+                except Exception as perm_error:
+                    # Non-fatal: Log warning but don't fail the registration
+                    print(f"⚠️ Warning: Failed to auto-add owner permission: {perm_error}")
+            
             return JSONResponse(
                 status_code=201,
                 content={
@@ -177,7 +233,8 @@ async def register_mcp(request: Request):
                     "server_key": registered_data.get("server_key"),
                     "ip": client_ip,
                     "created_at": registered_data.get("created_at"),
-                    "is_reregistration": False
+                    "is_reregistration": False,
+                    "owner_permission_added": owner_permission_added
                 }
             )
         else:
