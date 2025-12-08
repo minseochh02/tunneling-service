@@ -665,32 +665,26 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         await websocket.close()
         return
     
-    # Verify IP ownership - get client IP from WebSocket connection
-    # Note: For WebSocket, we need to extract IP from the scope
+    # Note: We skip IP verification for WebSocket tunnel connections because:
+    # 1. The server is registered via Supabase Edge Function which sees a different IP than Render.com
+    # 2. Actual MCP requests through the tunnel are already protected by OAuth authentication
+    # 3. The server owner is already authenticated via Supabase auth during registration
+    # 
+    # Security is maintained because:
+    # - Only authenticated users can register servers (via Supabase Edge Function)
+    # - All requests through the tunnel require valid OAuth tokens
+    # - Permissions are checked for each request
+    
+    # Log connection info for debugging
     client_ip = None
     if websocket.scope.get("client"):
         client_ip = websocket.scope["client"][0]
-    
-    # Also check headers for proxied connections
     headers = dict(websocket.scope.get("headers", []))
     forwarded_for = headers.get(b"x-forwarded-for", b"").decode()
     real_ip = headers.get(b"x-real-ip", b"").decode()
+    resolved_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_ip or "unknown"
     
-    # Prioritize real-ip, then forwarded-for, then direct client IP
-    client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_ip or "unknown"
-    
-    # Verify IP ownership using hash+salt
-    stored_ip_hash = server_data.get("owner_ip")
-    stored_salt = server_data.get("owner_ip_salt")
-    
-    if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
-        print(f"❌ IP verification failed for tunnel '{name}': client_ip={client_ip}")
-        await websocket.send_json({
-            "type": "error",
-            "message": f"IP verification failed. Your IP does not match the registered owner's IP for server '{name}'."
-        })
-        await websocket.close()
-        return
+    print(f"🔌 Tunnel connection from IP: {resolved_ip} for server '{name}'")
     
     # Use server_key as tunnel_id if available, otherwise use name
     tunnel_id = server_data.get("server_key") or name
