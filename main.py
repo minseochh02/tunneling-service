@@ -45,9 +45,12 @@ streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 
 def verify_ip_ownership(client_ip: str, stored_ip_hash: str, stored_salt: str = None) -> bool:
     """
-    Verify that the client IP matches the stored owner IP.
+    LEGACY: Verify that the client IP matches the stored owner IP.
     Supports both legacy (plain IP) and new (hashed IP with salt) formats.
+    This is kept for backward compatibility with servers that don't have owner_user_id.
     """
+    if not stored_ip_hash:
+        return False
     if not stored_salt:
         # Legacy: direct comparison
         return stored_ip_hash == client_ip
@@ -56,6 +59,69 @@ def verify_ip_ownership(client_ip: str, stored_ip_hash: str, stored_salt: str = 
         combined = (client_ip + stored_salt).encode('utf-8')
         computed_hash = hashlib.sha256(combined).hexdigest()
         return computed_hash == stored_ip_hash
+
+
+def get_user_from_auth_header(request: Request) -> tuple[str | None, str | None]:
+    """
+    Extract user ID and email from Authorization header.
+    Returns (user_id, user_email) or (None, None) if not authenticated.
+    """
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return None, None
+    
+    token = auth_header.replace("Bearer ", "")
+    try:
+        user_response = supabase.auth.get_user(token)
+        if user_response and user_response.user:
+            return user_response.user.id, user_response.user.email
+    except Exception as e:
+        print(f"⚠️ Failed to get user from token: {e}")
+    
+    return None, None
+
+
+def get_client_ip(request: Request) -> str:
+    """Extract client IP from request headers."""
+    forwarded_for = request.headers.get("x-forwarded-for")
+    real_ip = request.headers.get("x-real-ip")
+    client_host = request.client.host if request.client else None
+    return real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
+
+
+def verify_ownership(request: Request, server_data: dict) -> tuple[bool, str | None]:
+    """
+    Verify server ownership using User ID (preferred) or IP (legacy fallback).
+    Returns (is_owner, error_message).
+    
+    Priority:
+    1. User ID verification (if owner_user_id is set and user is authenticated)
+    2. IP verification (legacy fallback for servers without owner_user_id)
+    """
+    # Try User ID verification first (preferred method)
+    user_id, user_email = get_user_from_auth_header(request)
+    stored_owner_id = server_data.get("owner_user_id")
+    
+    if stored_owner_id:
+        # Server has User ID-based ownership
+        if not user_id:
+            return False, "Authentication required. Please include a valid Bearer token."
+        if user_id == stored_owner_id:
+            print(f"✅ Ownership verified via User ID for {user_email}")
+            return True, None
+        else:
+            return False, "You are not the owner of this server"
+    
+    # Fallback to IP verification for legacy servers (no owner_user_id)
+    client_ip = get_client_ip(request)
+    stored_ip_hash = server_data.get("owner_ip")
+    stored_salt = server_data.get("owner_ip_salt")
+    
+    if verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
+        print(f"✅ Ownership verified via IP (legacy) for {client_ip}")
+        return True, None
+    
+    return False, "Your IP does not match the server owner's IP. If you're the owner, please re-register to update ownership."
 
 @app.get("/")
 async def root():
@@ -68,7 +134,7 @@ async def root():
 
 @app.post("/register")
 async def register_mcp(request: Request):
-    """Register MCP server - IP-based, no authentication required"""
+    """Register MCP server - User ID-based ownership (with IP fallback for legacy)"""
     try:
         # Parse request body
         body = await request.json()
@@ -89,47 +155,72 @@ async def register_mcp(request: Request):
                 }
             )
         
-        # Extract IP information
-        forwarded_for = request.headers.get("x-forwarded-for")
-        real_ip = request.headers.get("x-real-ip")
-        client_host = request.client.host if request.client else None
+        # Extract user from auth header (preferred ownership method)
+        user_id, user_email = get_user_from_auth_header(request)
         
-        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
-        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
+        # Get client IP (fallback for legacy, also for logging)
+        client_ip = get_client_ip(request)
+        
+        # Use authenticated user's email if owner_email not provided
+        if not owner_email and user_email:
+            owner_email = user_email
         
         # Check if server_key is already taken
-        existing = supabase.table("mcp_servers").select("id, name, server_key, owner_ip, owner_ip_salt, created_at").eq("server_key", server_key).execute()
+        existing = supabase.table("mcp_servers").select("id, name, server_key, owner_user_id, owner_ip, owner_ip_salt, created_at").eq("server_key", server_key).execute()
         
         if existing.data and len(existing.data) > 0:
             existing_record = existing.data[0]
+            existing_owner_id = existing_record.get("owner_user_id")
             existing_ip_hash = existing_record.get("owner_ip")
             existing_salt = existing_record.get("owner_ip_salt")
             
-            # Check if it's the same IP (owner trying to re-register/update)
-            if verify_ip_ownership(client_ip, existing_ip_hash, existing_salt):
-                # Same IP - update the record
-                update_result = supabase.table("mcp_servers").update({
+            # Check ownership: User ID first, then IP fallback
+            is_owner = False
+            ownership_method = None
+            
+            # Method 1: User ID verification (preferred)
+            if existing_owner_id and user_id:
+                if user_id == existing_owner_id:
+                    is_owner = True
+                    ownership_method = "user_id"
+                    print(f"✅ Re-registration ownership verified via User ID: {user_email}")
+            
+            # Method 2: IP verification (legacy fallback - only if no owner_user_id set)
+            if not is_owner and not existing_owner_id:
+                if verify_ip_ownership(client_ip, existing_ip_hash, existing_salt):
+                    is_owner = True
+                    ownership_method = "ip_legacy"
+                    print(f"✅ Re-registration ownership verified via IP (legacy): {client_ip}")
+            
+            if is_owner:
+                # Owner verified - update the record
+                update_data = {
                     "name": name,
                     "description": description,
                     "connection_url": connection_url,
                     "max_concurrent_connections": max_concurrent_connections,
                     "updated_at": datetime.now().isoformat(),
                     "status": "active"
-                }).eq("server_key", server_key).execute()
+                }
+                
+                # Upgrade legacy IP-only servers to User ID ownership
+                if ownership_method == "ip_legacy" and user_id:
+                    update_data["owner_user_id"] = user_id
+                    print(f"⬆️ Upgrading server '{server_key}' from IP to User ID ownership")
+                
+                update_result = supabase.table("mcp_servers").update(update_data).eq("server_key", server_key).execute()
                 
                 if update_result.data:
                     updated_data = update_result.data[0]
                     server_id = updated_data.get("id")
                     
-                    # Auto-add owner permission if email was provided (handles case where owner wasn't added before)
+                    # Auto-add owner permission if email was provided
                     owner_permission_added = False
                     if owner_email and server_id:
                         try:
-                            # Check if permission already exists
                             existing_perm = supabase.table("mcp_server_permissions").select("id").eq("server_id", server_id).eq("allowed_email", owner_email.lower()).execute()
                             
                             if not existing_perm.data or len(existing_perm.data) == 0:
-                                # Permission doesn't exist, create it
                                 perm_result = supabase.table("mcp_server_permissions").insert({
                                     "server_id": server_id,
                                     "allowed_email": owner_email.lower(),
@@ -144,7 +235,6 @@ async def register_mcp(request: Request):
                                     owner_permission_added = True
                                     print(f"✅ Auto-added owner permission for {owner_email} (re-registration)")
                             else:
-                                # Permission already exists
                                 owner_permission_added = True
                                 print(f"ℹ️ Owner permission already exists for {owner_email}")
                         except Exception as perm_error:
@@ -158,20 +248,21 @@ async def register_mcp(request: Request):
                             "name": updated_data.get("name"),
                             "id": updated_data.get("id"),
                             "server_key": updated_data.get("server_key"),
-                            "ip": client_ip,
+                            "owner_id": user_id,
                             "created_at": updated_data.get("created_at"),
                             "is_reregistration": True,
-                            "owner_permission_added": owner_permission_added
+                            "owner_permission_added": owner_permission_added,
+                            "ownership_upgraded": ownership_method == "ip_legacy" and user_id is not None
                         }
                     )
             else:
-                # Different IP - server key taken by someone else
+                # Not the owner - server key taken by someone else
                 return JSONResponse(
                     status_code=409,
                     content={
                         "success": False,
                         "error": "Server key already exists",
-                        "message": f"Server key '{server_key}' is already registered by a different IP address",
+                        "message": f"Server key '{server_key}' is already registered by another user",
                         "existing_record": {
                             "name": existing_record.get("name"),
                             "server_key": existing_record.get("server_key"),
@@ -181,15 +272,16 @@ async def register_mcp(request: Request):
                 )
         
         # Server key doesn't exist - create new registration
-        # Hash the IP with a random salt (matches Supabase Edge Function logic)
-        ip_salt = os.urandom(16).hex()  # 16 bytes = 32 hex chars
+        # Hash the IP with a random salt (kept for backward compatibility)
+        ip_salt = os.urandom(16).hex()
         combined = (client_ip + ip_salt).encode('utf-8')
         ip_hash = hashlib.sha256(combined).hexdigest()
         
         result = supabase.table("mcp_servers").insert({
-            "owner_ip": ip_hash,
+            "owner_user_id": user_id,  # NEW: User ID-based ownership (can be None if not authenticated)
+            "owner_ip": ip_hash,        # Legacy: kept for backward compatibility
             "owner_ip_salt": ip_salt,
-            "owner_id": None,  # Optional: can be linked later via OAuth
+            "owner_id": None,           # Deprecated: old field
             "name": name,
             "description": description,
             "server_key": server_key,
@@ -220,7 +312,6 @@ async def register_mcp(request: Request):
                         owner_permission_added = True
                         print(f"✅ Auto-added owner permission for {owner_email}")
                 except Exception as perm_error:
-                    # Non-fatal: Log warning but don't fail the registration
                     print(f"⚠️ Warning: Failed to auto-add owner permission: {perm_error}")
             
             return JSONResponse(
@@ -231,7 +322,7 @@ async def register_mcp(request: Request):
                     "name": registered_data.get("name"),
                     "id": registered_data.get("id"),
                     "server_key": registered_data.get("server_key"),
-                    "ip": client_ip,
+                    "owner_id": user_id,
                     "created_at": registered_data.get("created_at"),
                     "is_reregistration": False,
                     "owner_permission_added": owner_permission_added
@@ -269,16 +360,8 @@ async def register_mcp(request: Request):
 
 @app.post("/permissions")
 async def add_permissions(request: Request):
-    """Add allowed email(s) to server - IP-based authentication"""
+    """Add allowed email(s) to server - User ID or IP-based authentication"""
     try:
-        # Extract client IP
-        forwarded_for = request.headers.get("x-forwarded-for")
-        real_ip = request.headers.get("x-real-ip")
-        client_host = request.client.host if request.client else None
-        
-        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
-        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
-        
         # Parse request body
         body = await request.json()
         server_key = body.get("server_key")
@@ -297,7 +380,7 @@ async def add_permissions(request: Request):
                 }
             )
         
-        # Verify server exists and IP matches
+        # Verify server exists
         server = supabase.table("mcp_servers").select("*").eq("server_key", server_key).single().execute()
         
         if not server.data:
@@ -310,29 +393,31 @@ async def add_permissions(request: Request):
                 }
             )
         
-        # Verify IP ownership using hash+salt
-        stored_ip_hash = server.data.get("owner_ip")
-        stored_salt = server.data.get("owner_ip_salt")
+        # Verify ownership (User ID first, then IP fallback)
+        is_owner, error_message = verify_ownership(request, server.data)
         
-        if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
+        if not is_owner:
             return JSONResponse(
                 status_code=403,
                 content={
                     "success": False,
                     "error": "Permission denied",
-                    "message": "Your IP does not match the server owner's IP"
+                    "message": error_message
                 }
             )
+        
+        # Get granter info for audit
+        user_id, user_email = get_user_from_auth_header(request)
         
         # Add permissions for each email
         permissions_to_add = []
         for email in emails:
             permissions_to_add.append({
                 "server_id": server.data["id"],
-                "allowed_email": email.lower(),  # Store lowercase
+                "allowed_email": email.lower(),
                 "status": "pending",
                 "access_level": access_level,
-                "granted_by_ip": client_ip,
+                "granted_by_user_id": user_id,  # Track who granted (if authenticated)
                 "expires_at": expires_at,
                 "notes": notes
             })
@@ -381,17 +466,9 @@ async def add_permissions(request: Request):
 
 @app.get("/permissions/{server_key}")
 async def get_permissions(server_key: str, request: Request):
-    """Get all permissions for a server - IP-based authentication"""
+    """Get all permissions for a server - User ID or IP-based authentication"""
     try:
-        # Extract client IP
-        forwarded_for = request.headers.get("x-forwarded-for")
-        real_ip = request.headers.get("x-real-ip")
-        client_host = request.client.host if request.client else None
-        
-        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
-        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
-        
-        # Verify server exists and IP matches
+        # Verify server exists
         server = supabase.table("mcp_servers").select("*").eq("server_key", server_key).single().execute()
         
         if not server.data:
@@ -404,17 +481,16 @@ async def get_permissions(server_key: str, request: Request):
                 }
             )
         
-        # Verify IP ownership using hash+salt
-        stored_ip_hash = server.data.get("owner_ip")
-        stored_salt = server.data.get("owner_ip_salt")
+        # Verify ownership (User ID first, then IP fallback)
+        is_owner, error_message = verify_ownership(request, server.data)
         
-        if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
+        if not is_owner:
             return JSONResponse(
                 status_code=403,
                 content={
                     "success": False,
                     "error": "Permission denied",
-                    "message": "Your IP does not match the server owner's IP"
+                    "message": error_message
                 }
             )
         
@@ -443,18 +519,10 @@ async def get_permissions(server_key: str, request: Request):
 
 @app.patch("/permissions/{permission_id}")
 async def update_permission(permission_id: str, request: Request):
-    """Update a permission - IP-based authentication"""
+    """Update a permission - User ID or IP-based authentication"""
     try:
-        # Extract client IP
-        forwarded_for = request.headers.get("x-forwarded-for")
-        real_ip = request.headers.get("x-real-ip")
-        client_host = request.client.host if request.client else None
-        
-        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
-        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
-        
-        # Get permission and verify ownership
-        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_ip, owner_ip_salt)").eq("id", permission_id).single().execute()
+        # Get permission and associated server for ownership verification
+        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_user_id, owner_ip, owner_ip_salt)").eq("id", permission_id).single().execute()
         
         if not permission.data:
             return JSONResponse(
@@ -466,17 +534,17 @@ async def update_permission(permission_id: str, request: Request):
                 }
             )
         
-        # Verify IP ownership using hash+salt
-        stored_ip_hash = permission.data["mcp_servers"]["owner_ip"]
-        stored_salt = permission.data["mcp_servers"].get("owner_ip_salt")
+        # Verify ownership (User ID first, then IP fallback)
+        server_data = permission.data["mcp_servers"]
+        is_owner, error_message = verify_ownership(request, server_data)
         
-        if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
+        if not is_owner:
             return JSONResponse(
                 status_code=403,
                 content={
                     "success": False,
                     "error": "Permission denied",
-                    "message": "Your IP does not match the server owner's IP"
+                    "message": error_message
                 }
             )
         
@@ -549,18 +617,10 @@ async def update_permission(permission_id: str, request: Request):
 
 @app.delete("/permissions/{permission_id}")
 async def delete_permission(permission_id: str, request: Request):
-    """Revoke a permission - IP-based authentication"""
+    """Revoke a permission - User ID or IP-based authentication"""
     try:
-        # Extract client IP
-        forwarded_for = request.headers.get("x-forwarded-for")
-        real_ip = request.headers.get("x-real-ip")
-        client_host = request.client.host if request.client else None
-        
-        # Get client IP (prioritize real-ip, then forwarded-for, then client host)
-        client_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
-        
-        # Get permission and verify ownership
-        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_ip, owner_ip_salt)").eq("id", permission_id).single().execute()
+        # Get permission and associated server for ownership verification
+        permission = supabase.table("mcp_server_permissions").select("*, mcp_servers!inner(owner_user_id, owner_ip, owner_ip_salt)").eq("id", permission_id).single().execute()
         
         if not permission.data:
             return JSONResponse(
@@ -572,17 +632,17 @@ async def delete_permission(permission_id: str, request: Request):
                 }
             )
         
-        # Verify IP ownership using hash+salt
-        stored_ip_hash = permission.data["mcp_servers"]["owner_ip"]
-        stored_salt = permission.data["mcp_servers"].get("owner_ip_salt")
+        # Verify ownership (User ID first, then IP fallback)
+        server_data = permission.data["mcp_servers"]
+        is_owner, error_message = verify_ownership(request, server_data)
         
-        if not verify_ip_ownership(client_ip, stored_ip_hash, stored_salt):
+        if not is_owner:
             return JSONResponse(
                 status_code=403,
                 content={
                     "success": False,
                     "error": "Permission denied",
-                    "message": "Your IP does not match the server owner's IP"
+                    "message": error_message
                 }
             )
         
@@ -643,8 +703,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
     
     # Check if server is registered in mcp_servers table (check by server_key or name)
     # Try server_key first, then fallback to name for backwards compatibility
-    # Include owner_ip and owner_ip_salt for IP verification
-    existing = supabase.table("mcp_servers").select("id, name, server_key, status, owner_ip, owner_ip_salt").or_(f"server_key.eq.{name},name.eq.{name}").execute()
+    existing = supabase.table("mcp_servers").select("id, name, server_key, status, owner_user_id").or_(f"server_key.eq.{name},name.eq.{name}").execute()
     
     if not existing.data or len(existing.data) == 0:
         await websocket.send_json({
