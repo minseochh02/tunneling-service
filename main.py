@@ -272,15 +272,9 @@ async def register_mcp(request: Request):
                 )
         
         # Server key doesn't exist - create new registration
-        # Hash the IP with a random salt (kept for backward compatibility)
-        ip_salt = os.urandom(16).hex()
-        combined = (client_ip + ip_salt).encode('utf-8')
-        ip_hash = hashlib.sha256(combined).hexdigest()
-        
+        # Note: IP-based ownership has been removed - only User ID-based ownership is used
         result = supabase.table("mcp_servers").insert({
-            "owner_user_id": user_id,  # NEW: User ID-based ownership (can be None if not authenticated)
-            "owner_ip": ip_hash,        # Legacy: kept for backward compatibility
-            "owner_ip_salt": ip_salt,
+            "owner_user_id": user_id,   # User ID-based ownership (primary)
             "owner_id": None,           # Deprecated: old field
             "name": name,
             "description": description,
@@ -288,6 +282,7 @@ async def register_mcp(request: Request):
             "connection_url": connection_url,
             "max_concurrent_connections": max_concurrent_connections,
             "status": "active"
+            # owner_ip and owner_ip_salt removed - no longer storing IP addresses
         }).execute()
         
         if result.data and len(result.data) > 0:
