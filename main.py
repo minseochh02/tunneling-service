@@ -9,6 +9,7 @@ import hashlib
 from datetime import datetime
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from sheet_sync_router import sheet_sync_router
 
 # Load environment variables
 load_dotenv()
@@ -23,6 +24,10 @@ if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
 app = FastAPI()
+
+# After your app is created, include the router
+
+app.include_router(sheet_sync_router)
 
 # Configure CORS
 app.add_middleware(
@@ -282,7 +287,6 @@ async def register_mcp(request: Request):
             "connection_url": connection_url,
             "max_concurrent_connections": max_concurrent_connections,
             "status": "active"
-            # owner_ip and owner_ip_salt removed - no longer storing IP addresses
         }).execute()
         
         if result.data and len(result.data) > 0:
