@@ -474,15 +474,11 @@ def get_google_credentials():
             info,
             scopes=[
                 'https://www.googleapis.com/auth/userinfo.email',
-                'https://www.googleapis.com/auth/script.metrics',
-                'https://www.googleapis.com/auth/script.storage',
                 'https://www.googleapis.com/auth/drive.file',
                 'https://www.googleapis.com/auth/script.projects',
                 'https://www.googleapis.com/auth/script.scriptapp',
-                'https://www.googleapis.com/auth/script.send_mail',
+                'https://www.googleapis.com/auth/gmail.send',
                 'https://www.googleapis.com/auth/script.deployments',
-                'https://www.googleapis.com/auth/script.processes',
-                'https://www.googleapis.com/auth/script.triggers',
                 'https://www.googleapis.com/auth/script.external_request',
                 'https://www.googleapis.com/auth/script.webapp.deploy',
                 'https://www.googleapis.com/auth/drive.scripts'
@@ -500,10 +496,8 @@ def get_google_credentials():
                 'https://www.googleapis.com/auth/drive.file',
                 'https://www.googleapis.com/auth/script.projects',
                 'https://www.googleapis.com/auth/script.scriptapp',
-                'https://www.googleapis.com/auth/script.send_mail',
+                'https://www.googleapis.com/auth/gmail.send',
                 'https://www.googleapis.com/auth/script.deployments',
-                'https://www.googleapis.com/auth/script.processes',
-                'https://www.googleapis.com/auth/script.triggers',
                 'https://www.googleapis.com/auth/script.external_request',
                 'https://www.googleapis.com/auth/script.webapp.deploy',
                 'https://www.googleapis.com/auth/drive.scripts'
