@@ -45,6 +45,7 @@ app.add_middleware(
 
 # Store active tunnel connections
 active_tunnels = {}  # {tunnel_id: websocket}
+tunnel_api_keys = {}  # {tunnel_id: api_key} - registered via WebSocket at connect time
 pending_requests = {}  # {request_id: asyncio.Future}
 streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 
@@ -812,6 +813,12 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
                 if request_id in streaming_requests:
                     await streaming_requests[request_id].put(None)  # Signal end
             
+            elif data.get("type") == "register_api_key":
+                api_key = data.get("api_key")
+                if api_key:
+                    tunnel_api_keys[tunnel_id] = api_key
+                    print(f"🔑 API key registered for tunnel: {tunnel_id}")
+
             elif data["type"] == "pong":
                 # Client responded to ping - connection is healthy
                 print(f"💓 Heartbeat acknowledged for {tunnel_id}")
@@ -825,6 +832,8 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         heartbeat_task.cancel()
         if tunnel_id in active_tunnels:
             del active_tunnels[tunnel_id]
+        if tunnel_id in tunnel_api_keys:
+            del tunnel_api_keys[tunnel_id]
         
         # Clean up any pending streaming requests for this tunnel
         dead_streams = [req_id for req_id, queue in streaming_requests.items() if req_id.startswith(tunnel_id)]
@@ -908,7 +917,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
-                "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization",
+                "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization, X-Api-Key",
             }
         )
     
@@ -920,94 +929,92 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         )
     
     # ============================================
-    # OAuth Authentication & Authorization
+    # API Key Authentication (Apps Script / service accounts)
     # ============================================
-    
-    # Extract Authorization header
-    auth_header = request.headers.get("Authorization")
-    if not auth_header or not auth_header.startswith("Bearer "):
-        return JSONResponse(
-            status_code=401,
-            content={
-                "error": "Unauthorized",
-                "message": "Missing or invalid Authorization header. Please authenticate with Supabase OAuth."
-            }
-        )
-    
-    # Extract token
-    access_token = auth_header.replace("Bearer ", "")
-    
-    try:
-        # Verify token with Supabase Auth
-        user_response = supabase.auth.get_user(access_token)
-        
-        if not user_response or not user_response.user:
+    api_key_header = request.headers.get("X-Api-Key")
+    if api_key_header:
+        stored_key = tunnel_api_keys.get(tunnel_id)
+        if not stored_key or stored_key != api_key_header:
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Unauthorized", "message": "Invalid API key"}
+            )
+        print(f"🔑 API key auth granted for tunnel: {tunnel_id}")
+    else:
+        # ============================================
+        # OAuth Authentication & Authorization
+        # ============================================
+
+        # Extract Authorization header
+        auth_header = request.headers.get("Authorization")
+        if not auth_header or not auth_header.startswith("Bearer "):
             return JSONResponse(
                 status_code=401,
                 content={
                     "error": "Unauthorized",
-                    "message": "Invalid or expired access token"
+                    "message": "Missing Authorization header or X-Api-Key. Use Supabase OAuth or provide X-Api-Key."
                 }
             )
-        
-        user = user_response.user
-        user_email = user.email
-        user_id = user.id
-        
-        print(f"🔐 Authenticated user: {user_email}")
-        
-        # Get server info by tunnel_id (which is server_key)
-        server = supabase.table("mcp_servers").select("*").eq("server_key", tunnel_id).single().execute()
-        
-        if not server.data:
-            return JSONResponse(
-                status_code=404,
-                content={
-                    "error": "Server not found",
-                    "message": f"Server '{tunnel_id}' does not exist"
-                }
-            )
-        
-        server_id = server.data["id"]
-        
-        # Check if user has permission to access this server
-        permission = supabase.table("mcp_server_permissions").select("*").eq("server_id", server_id).eq("allowed_email", user_email).single().execute()
-        
-        if not permission.data:
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "error": "Forbidden",
-                    "message": f"User '{user_email}' does not have permission to access this server. Contact the server owner to request access."
-                }
-            )
-        
-        # Check permission status
-        perm_status = permission.data.get("status")
-        if perm_status == "revoked":
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "error": "Forbidden",
-                    "message": "Your access to this server has been revoked"
-                }
-            )
-        elif perm_status == "expired":
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "error": "Forbidden",
-                    "message": "Your access to this server has expired"
-                }
-            )
-        
-        # Check expiration date
-        expires_at = permission.data.get("expires_at")
-        if expires_at:
-            expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-            if datetime.now(expiry.tzinfo) > expiry:
-                # Auto-expire the permission
-                supabase.table("mcp_server_permissions").update({"status": "expired"}).eq("id", permission.data["id"]).execute()
+
+        # Extract token
+        access_token = auth_header.replace("Bearer ", "")
+
+        try:
+            # Verify token with Supabase Auth
+            user_response = supabase.auth.get_user(access_token)
+
+            if not user_response or not user_response.user:
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "error": "Unauthorized",
+                        "message": "Invalid or expired access token"
+                    }
+                )
+
+            user = user_response.user
+            user_email = user.email
+            user_id = user.id
+
+            print(f"🔐 Authenticated user: {user_email}")
+
+            # Get server info by tunnel_id (which is server_key)
+            server = supabase.table("mcp_servers").select("*").eq("server_key", tunnel_id).single().execute()
+
+            if not server.data:
+                return JSONResponse(
+                    status_code=404,
+                    content={
+                        "error": "Server not found",
+                        "message": f"Server '{tunnel_id}' does not exist"
+                    }
+                )
+
+            server_id = server.data["id"]
+
+            # Check if user has permission to access this server
+            permission = supabase.table("mcp_server_permissions").select("*").eq("server_id", server_id).eq("allowed_email", user_email).single().execute()
+
+            if not permission.data:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "Forbidden",
+                        "message": f"User '{user_email}' does not have permission to access this server. Contact the server owner to request access."
+                    }
+                )
+
+            # Check permission status
+            perm_status = permission.data.get("status")
+            if perm_status == "revoked":
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "Forbidden",
+                        "message": "Your access to this server has been revoked"
+                    }
+                )
+            elif perm_status == "expired":
                 return JSONResponse(
                     status_code=403,
                     content={
@@ -1015,53 +1022,68 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                         "message": "Your access to this server has expired"
                     }
                 )
-        
-        # If permission is pending, activate it on first use
-        if perm_status == "pending":
-            supabase.table("mcp_server_permissions").update({
-                "status": "active",
-                "activated_at": datetime.utcnow().isoformat(),
-                "user_id": user_id
-            }).eq("id", permission.data["id"]).execute()
-            print(f"✅ Activated permission for {user_email}")
-        
-        # Update or create session
-        # Try to find existing active session
-        existing_session = supabase.table("mcp_connection_sessions").select("*").eq("permission_id", permission.data["id"]).eq("status", "active").execute()
-        
-        if existing_session.data and len(existing_session.data) > 0:
-            # Update existing session
-            session_id = existing_session.data[0]["id"]
-            supabase.table("mcp_connection_sessions").update({
-                "last_activity_at": datetime.utcnow().isoformat(),
-                "requests_count": existing_session.data[0]["requests_count"] + 1
-            }).eq("id", session_id).execute()
-        else:
-            # Create new session
-            import secrets
-            session_token = secrets.token_urlsafe(32)
-            supabase.table("mcp_connection_sessions").insert({
-                "server_id": server_id,
-                "user_id": user_id,
-                "permission_id": permission.data["id"],
-                "session_token": session_token,
-                "status": "active",
-                "connected_at": datetime.utcnow().isoformat(),
-                "last_activity_at": datetime.utcnow().isoformat(),
-                "requests_count": 1
-            }).execute()
-        
-        print(f"✅ Authorization granted for {user_email} to access {tunnel_id}")
-        
-    except Exception as e:
-        print(f"❌ Authentication error: {e}")
-        return JSONResponse(
-            status_code=401,
-            content={
-                "error": "Authentication failed",
-                "message": str(e)
-            }
-        )
+
+            # Check expiration date
+            expires_at = permission.data.get("expires_at")
+            if expires_at:
+                expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+                if datetime.now(expiry.tzinfo) > expiry:
+                    # Auto-expire the permission
+                    supabase.table("mcp_server_permissions").update({"status": "expired"}).eq("id", permission.data["id"]).execute()
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "error": "Forbidden",
+                            "message": "Your access to this server has expired"
+                        }
+                    )
+
+            # If permission is pending, activate it on first use
+            if perm_status == "pending":
+                supabase.table("mcp_server_permissions").update({
+                    "status": "active",
+                    "activated_at": datetime.utcnow().isoformat(),
+                    "user_id": user_id
+                }).eq("id", permission.data["id"]).execute()
+                print(f"✅ Activated permission for {user_email}")
+
+            # Update or create session
+            # Try to find existing active session
+            existing_session = supabase.table("mcp_connection_sessions").select("*").eq("permission_id", permission.data["id"]).eq("status", "active").execute()
+
+            if existing_session.data and len(existing_session.data) > 0:
+                # Update existing session
+                session_id = existing_session.data[0]["id"]
+                supabase.table("mcp_connection_sessions").update({
+                    "last_activity_at": datetime.utcnow().isoformat(),
+                    "requests_count": existing_session.data[0]["requests_count"] + 1
+                }).eq("id", session_id).execute()
+            else:
+                # Create new session
+                import secrets
+                session_token = secrets.token_urlsafe(32)
+                supabase.table("mcp_connection_sessions").insert({
+                    "server_id": server_id,
+                    "user_id": user_id,
+                    "permission_id": permission.data["id"],
+                    "session_token": session_token,
+                    "status": "active",
+                    "connected_at": datetime.utcnow().isoformat(),
+                    "last_activity_at": datetime.utcnow().isoformat(),
+                    "requests_count": 1
+                }).execute()
+
+            print(f"✅ Authorization granted for {user_email} to access {tunnel_id}")
+
+        except Exception as e:
+            print(f"❌ Authentication error: {e}")
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Authentication failed",
+                    "message": str(e)
+                }
+            )
     
     # ============================================
     # Forward Request to Tunnel
