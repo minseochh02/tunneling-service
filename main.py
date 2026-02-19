@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, Cookie
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
@@ -6,7 +6,8 @@ import json
 import uuid
 import os
 import hashlib
-from datetime import datetime
+import secrets
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from sheet_sync_router import sheet_sync_router
@@ -48,6 +49,10 @@ active_tunnels = {}  # {tunnel_id: websocket}
 tunnel_api_keys = {}  # {tunnel_id: api_key} - registered via WebSocket at connect time
 pending_requests = {}  # {request_id: asyncio.Future}
 streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
+
+# Session storage for authenticated iframe access
+# {session_token: {user_id, user_email, tunnel_id, created_at, expires_at}}
+iframe_sessions = {}
 
 def verify_ip_ownership(client_ip: str, stored_ip_hash: str, stored_salt: str = None) -> bool:
     """
@@ -906,6 +911,129 @@ async def ping_server(tunnel_id: str, request: Request):
         }
     )
 
+@app.post("/t/{tunnel_id}/auth")
+async def authenticate_session(tunnel_id: str, request: Request, response: Response):
+    """
+    Create an authenticated session for iframe access.
+    Client calls this endpoint with Bearer token, receives a secure session cookie.
+    """
+    # Extract Authorization header
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return JSONResponse(
+            status_code=401,
+            content={
+                "error": "Unauthorized",
+                "message": "Missing Authorization header"
+            }
+        )
+
+    # Extract token
+    access_token = auth_header.replace("Bearer ", "")
+
+    try:
+        # Verify token with Supabase Auth
+        user_response = supabase.auth.get_user(access_token)
+
+        if not user_response or not user_response.user:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "message": "Invalid or expired access token"
+                }
+            )
+
+        user = user_response.user
+        user_email = user.email
+        user_id = user.id
+
+        print(f"🔐 Creating session for user: {user_email}")
+
+        # Get server info by tunnel_id
+        server = supabase.table("mcp_servers").select("*").eq("server_key", tunnel_id).single().execute()
+
+        if not server.data:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "error": "Server not found",
+                    "message": f"Server '{tunnel_id}' does not exist"
+                }
+            )
+
+        server_id = server.data["id"]
+
+        # Check if user has permission to access this server
+        permission = supabase.table("mcp_server_permissions").select("*").eq("server_id", server_id).eq("allowed_email", user_email).single().execute()
+
+        if not permission.data:
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "Forbidden",
+                    "message": f"User '{user_email}' does not have permission to access this server."
+                }
+            )
+
+        # Check permission status
+        perm_status = permission.data.get("status")
+        if perm_status != "active" and perm_status != "pending":
+            return JSONResponse(
+                status_code=403,
+                content={
+                    "error": "Forbidden",
+                    "message": "Your access to this server has been revoked or expired"
+                }
+            )
+
+        # Create session token
+        session_token = secrets.token_urlsafe(32)
+        session_data = {
+            "user_id": user_id,
+            "user_email": user_email,
+            "tunnel_id": tunnel_id,
+            "server_id": server_id,
+            "permission_id": permission.data["id"],
+            "created_at": datetime.utcnow().isoformat(),
+            "expires_at": (datetime.utcnow() + timedelta(hours=24)).isoformat()
+        }
+
+        # Store session
+        iframe_sessions[session_token] = session_data
+
+        # Set secure HTTP-only cookie
+        response.set_cookie(
+            key=f"egdesk_session_{tunnel_id}",
+            value=session_token,
+            httponly=True,
+            secure=True,  # HTTPS only
+            samesite="none",  # Required for cross-origin iframes
+            max_age=86400,  # 24 hours
+            path=f"/t/{tunnel_id}/"  # Scoped to this tunnel
+        )
+
+        print(f"✅ Session created for {user_email} on tunnel {tunnel_id}")
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "Session created successfully",
+                "expires_in": 86400
+            }
+        )
+
+    except Exception as e:
+        print(f"❌ Authentication error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": "Authentication failed",
+                "message": str(e)
+            }
+        )
+
 @app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def tunnel_request(tunnel_id: str, path: str, request: Request):
     """Public endpoint - forwards requests through tunnel with OAuth authentication"""
@@ -929,10 +1057,70 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         )
     
     # ============================================
+    # Session Cookie Authentication (for iframes)
+    # ============================================
+    session_cookie_name = f"egdesk_session_{tunnel_id}"
+    session_token = request.cookies.get(session_cookie_name)
+
+    if session_token and session_token in iframe_sessions:
+        session_data = iframe_sessions[session_token]
+
+        # Check if session expired
+        expires_at = datetime.fromisoformat(session_data["expires_at"])
+        if datetime.utcnow() > expires_at:
+            # Session expired - remove it
+            del iframe_sessions[session_token]
+            return JSONResponse(
+                status_code=401,
+                content={"error": "Session expired", "message": "Please re-authenticate"}
+            )
+
+        # Verify session is for this tunnel
+        if session_data["tunnel_id"] != tunnel_id:
+            return JSONResponse(
+                status_code=403,
+                content={"error": "Invalid session", "message": "Session not valid for this tunnel"}
+            )
+
+        print(f"🍪 Session auth: {session_data['user_email']} → {tunnel_id}")
+        # Session is valid - skip OAuth check and proceed to forwarding
+        # We'll set user_id and user_email for session tracking later
+        user_id = session_data["user_id"]
+        user_email = session_data["user_email"]
+        server_id = session_data["server_id"]
+        permission_id = session_data["permission_id"]
+
+        # Update session activity (optional)
+        # Update or create session in database for tracking
+        existing_session = supabase.table("mcp_connection_sessions").select("*").eq("permission_id", permission_id).eq("status", "active").execute()
+
+        if existing_session.data and len(existing_session.data) > 0:
+            # Update existing session
+            session_id = existing_session.data[0]["id"]
+            supabase.table("mcp_connection_sessions").update({
+                "last_activity_at": datetime.utcnow().isoformat(),
+                "requests_count": existing_session.data[0]["requests_count"] + 1
+            }).eq("id", session_id).execute()
+        else:
+            # Create new session
+            supabase.table("mcp_connection_sessions").insert({
+                "server_id": server_id,
+                "user_id": user_id,
+                "permission_id": permission_id,
+                "session_token": session_token[:16] + "...",  # Truncated for security
+                "status": "active",
+                "connected_at": datetime.utcnow().isoformat(),
+                "last_activity_at": datetime.utcnow().isoformat(),
+                "requests_count": 1
+            }).execute()
+
+        # Skip to request forwarding (jump past OAuth/API key checks)
+        pass  # Continue to request forwarding below
+
+    # ============================================
     # API Key Authentication (Apps Script / service accounts)
     # ============================================
-    api_key_header = request.headers.get("X-Api-Key")
-    if api_key_header:
+    elif (api_key_header := request.headers.get("X-Api-Key")):
         stored_key = tunnel_api_keys.get(tunnel_id)
         if not stored_key or stored_key != api_key_header:
             return JSONResponse(
@@ -945,19 +1133,26 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         # OAuth Authentication & Authorization
         # ============================================
 
-        # Extract Authorization header
+        # Extract token from Authorization header OR query parameter
+        # Query parameter support is for iframe-based access where headers can't be set
         auth_header = request.headers.get("Authorization")
-        if not auth_header or not auth_header.startswith("Bearer "):
+        access_token = None
+
+        if auth_header and auth_header.startswith("Bearer "):
+            # Token from header (preferred method)
+            access_token = auth_header.replace("Bearer ", "")
+        else:
+            # Token from query parameter (for iframe embedding)
+            access_token = request.query_params.get("token")
+
+        if not access_token:
             return JSONResponse(
                 status_code=401,
                 content={
                     "error": "Unauthorized",
-                    "message": "Missing Authorization header or X-Api-Key. Use Supabase OAuth or provide X-Api-Key."
+                    "message": "Missing Authorization header, X-Api-Key, or token query parameter. Use Supabase OAuth or provide X-Api-Key."
                 }
             )
-
-        # Extract token
-        access_token = auth_header.replace("Bearer ", "")
 
         try:
             # Verify token with Supabase Auth
