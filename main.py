@@ -1088,19 +1088,30 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     # ============================================
     # Forward Request to Tunnel
     # ============================================
-    
+
     websocket = active_tunnels[tunnel_id]
     request_id = str(uuid.uuid4())
-    
+
     # Read request body
     body = await request.body()
-    
+
+    # Check if this is a coding project route (/p/{project_name}/...)
+    full_path = "/" + path
+    is_project_route = full_path.startswith("/p/")
+    if is_project_route:
+        # Extract project name for logging
+        path_parts = full_path.split("/")
+        if len(path_parts) >= 3:
+            project_name = path_parts[2]
+            project_path = "/" + "/".join(path_parts[3:]) if len(path_parts) > 3 else "/"
+            print(f"🔀 Routing to coding project: {project_name} → {project_path}")
+
     # Prepare request data to send to client
     request_data = {
         "type": "request",
         "request_id": request_id,
         "method": request.method,
-        "path": "/" + path,
+        "path": full_path,
         "headers": dict(request.headers),
         "query_params": dict(request.query_params),
         "body": body.decode() if body else None
