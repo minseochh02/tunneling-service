@@ -36,6 +36,8 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",  # Next.js dev server
         "http://localhost:3001",
+        "https://egdesk.cloud",  # Production custom domain
+        "https://www.egdesk.cloud",  # Production with www
         "https://egdesk-website.vercel.app",  # Vercel production
         "https://egdesk-website-git-main-minseochhs-projects.vercel.app",  # Vercel preview
     ],
