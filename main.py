@@ -36,12 +36,13 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:3000",  # Next.js dev server
         "http://localhost:3001",
-        "https://egdesk-website.vercel.app",  # Vercel deployments
-        "*"  # Allow all origins (you can restrict this in production)
+        "https://egdesk-website.vercel.app",  # Vercel production
+        "https://egdesk-website-git-main-minseochhs-projects.vercel.app",  # Vercel preview
     ],
     allow_credentials=True,
     allow_methods=["*"],  # Allow all methods (GET, POST, PUT, DELETE, etc.)
     allow_headers=["*"],  # Allow all headers including Authorization
+    expose_headers=["Set-Cookie"],  # Allow browser to see Set-Cookie header
 )
 
 # Store active tunnel connections
