@@ -1322,7 +1322,8 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         "path": full_path,
         "headers": dict(request.headers),
         "query_params": dict(request.query_params),
-        "body": body.decode() if body else None
+        "body": body.decode() if body else None,
+        "tunnel_id": tunnel_id  # Include tunnel_id for base path construction
     }
     
     # Check if this is an SSE request (GET to /sse endpoint)
