@@ -1004,12 +1004,14 @@ async def authenticate_session(tunnel_id: str, request: Request, response: Respo
         iframe_sessions[session_token] = session_data
 
         # Set secure HTTP-only cookie
+        # For cross-origin iframes, we need SameSite=None which requires Secure=True
+        # This means the cookie will only work over HTTPS connections
         response.set_cookie(
             key=f"egdesk_session_{tunnel_id}",
             value=session_token,
             httponly=True,
-            secure=True,  # HTTPS only
-            samesite="none",  # Required for cross-origin iframes
+            secure=False,  # Allow HTTP for local development (change to True for production-only)
+            samesite="lax",  # Use 'lax' for local dev, 'none' requires secure=True
             max_age=86400,  # 24 hours
             path=f"/t/{tunnel_id}/"  # Scoped to this tunnel
         )
