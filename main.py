@@ -1067,6 +1067,11 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     session_cookie_name = f"egdesk_session_{tunnel_id}"
     session_token = request.cookies.get(session_cookie_name)
 
+    # Debug logging
+    print(f"🍪 Looking for cookie: {session_cookie_name}")
+    print(f"🍪 All cookies received: {list(request.cookies.keys())}")
+    print(f"🍪 Session token found: {bool(session_token)}")
+
     if session_token and session_token in iframe_sessions:
         session_data = iframe_sessions[session_token]
 
