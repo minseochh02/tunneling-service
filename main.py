@@ -797,8 +797,13 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
     try:
         # Listen for responses from client
         while True:
-            data = await websocket.receive_json()
-            
+            try:
+                data = await websocket.receive_json()
+                print(f"📨 WebSocket message received: type={data.get('type')}, request_id={data.get('request_id')}")
+            except Exception as json_error:
+                print(f"❌ Error parsing WebSocket message: {json_error}")
+                continue
+
             if data["type"] == "response":
                 request_id = data["request_id"]
                 print(f"📥 Received response for request {request_id}: status {data.get('status_code')}, body size: {len(data.get('body', ''))} bytes")
@@ -1403,25 +1408,30 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         # Handle regular request/response
         future = asyncio.Future()
         pending_requests[request_id] = future
-        
+
         try:
             # Send request to client through WebSocket
+            print(f"📤 Sending request {request_id} to client via WebSocket")
             await websocket.send_json(request_data)
-            
+            print(f"⏳ Waiting for response to request {request_id} (timeout: 30s)")
+
             # Wait for response (with timeout)
             response_data = await asyncio.wait_for(future, timeout=30.0)
-            
+
+            print(f"✅ Received response for {request_id}, status: {response_data.get('status_code')}")
+
             # Clean up
             del pending_requests[request_id]
-            
+
             # Return response to original requester
             return Response(
                 content=response_data.get("body", ""),
                 status_code=response_data.get("status_code", 200),
                 headers=response_data.get("headers", {})
             )
-            
+
         except asyncio.TimeoutError:
+            print(f"⏰ Timeout waiting for response to request {request_id}")
             del pending_requests[request_id]
             return JSONResponse(
                 status_code=504,
