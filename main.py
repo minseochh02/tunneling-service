@@ -1005,10 +1005,22 @@ async def authenticate_session(tunnel_id: str, request: Request, response: Respo
         # Store session
         iframe_sessions[session_token] = session_data
 
-        # Set secure HTTP-only cookie
+        print(f"✅ Session created for {user_email} on tunnel {tunnel_id}")
+
+        # Create response with session cookie
         # For cross-origin iframes, we MUST use SameSite=None + Secure=True
         # This means the website MUST be served over HTTPS (works on Vercel, not on http://localhost)
-        response.set_cookie(
+        json_response = JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "Session created successfully",
+                "expires_in": 86400
+            }
+        )
+
+        # Set secure HTTP-only cookie on the response we're returning
+        json_response.set_cookie(
             key=f"egdesk_session_{tunnel_id}",
             value=session_token,
             httponly=True,
@@ -1018,16 +1030,7 @@ async def authenticate_session(tunnel_id: str, request: Request, response: Respo
             path=f"/t/{tunnel_id}/"  # Scoped to this tunnel
         )
 
-        print(f"✅ Session created for {user_email} on tunnel {tunnel_id}")
-
-        return JSONResponse(
-            status_code=200,
-            content={
-                "success": True,
-                "message": "Session created successfully",
-                "expires_in": 86400
-            }
-        )
+        return json_response
 
     except Exception as e:
         print(f"❌ Authentication error: {e}")
