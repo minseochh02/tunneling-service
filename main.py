@@ -1423,11 +1423,20 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             # Clean up
             del pending_requests[request_id]
 
+            # Get headers and remove Content-Length (let FastAPI recalculate it)
+            # This is important because the tunnel client may have injected content (like <base> tags)
+            # which changes the body length
+            response_headers = response_data.get("headers", {})
+            if "content-length" in response_headers:
+                del response_headers["content-length"]
+            if "Content-Length" in response_headers:
+                del response_headers["Content-Length"]
+
             # Return response to original requester
             return Response(
                 content=response_data.get("body", ""),
                 status_code=response_data.get("status_code", 200),
-                headers=response_data.get("headers", {})
+                headers=response_headers
             )
 
         except asyncio.TimeoutError:
