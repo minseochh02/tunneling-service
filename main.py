@@ -801,9 +801,13 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
             
             if data["type"] == "response":
                 request_id = data["request_id"]
+                print(f"📥 Received response for request {request_id}: status {data.get('status_code')}, body size: {len(data.get('body', ''))} bytes")
                 if request_id in pending_requests:
                     # Resolve the pending request with response
+                    print(f"✅ Resolving pending request {request_id}")
                     pending_requests[request_id].set_result(data)
+                else:
+                    print(f"⚠️  Received response for unknown request: {request_id}")
             
             elif data["type"] == "stream_chunk":
                 # Handle streaming response chunks (for SSE)
