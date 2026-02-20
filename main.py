@@ -800,9 +800,21 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
             try:
                 data = await websocket.receive_json()
                 print(f"📨 WebSocket message received: type={data.get('type')}, request_id={data.get('request_id')}")
-            except Exception as json_error:
-                print(f"❌ Error parsing WebSocket message: {json_error}")
+            except json.JSONDecodeError as json_error:
+                # JSON parsing error - log but continue
+                print(f"⚠️ Invalid JSON received: {json_error}")
                 continue
+            except (WebSocketDisconnect, RuntimeError) as disconnect_error:
+                # Connection closed - break out of loop
+                if "disconnect" in str(disconnect_error).lower():
+                    print(f"🔌 WebSocket disconnected: {tunnel_id}")
+                else:
+                    print(f"🔌 WebSocket error (connection closed): {tunnel_id} - {disconnect_error}")
+                break
+            except Exception as e:
+                # Other errors - log and break to avoid infinite loop
+                print(f"❌ Unexpected WebSocket error: {e}")
+                break
 
             if data["type"] == "response":
                 request_id = data["request_id"]
@@ -813,7 +825,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
                     pending_requests[request_id].set_result(data)
                 else:
                     print(f"⚠️  Received response for unknown request: {request_id}")
-            
+
             elif data["type"] == "stream_chunk":
                 # Handle streaming response chunks (for SSE)
                 request_id = data["request_id"]
@@ -822,14 +834,14 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
                     await streaming_requests[request_id].put(data)
                 else:
                     print(f"⚠️  Received stream chunk for unknown request: {request_id}")
-            
+
             elif data["type"] == "stream_end":
                 # End of streaming response
                 request_id = data["request_id"]
                 print(f"🏁 Received stream_end for {request_id}")
                 if request_id in streaming_requests:
                     await streaming_requests[request_id].put(None)  # Signal end
-            
+
             elif data.get("type") == "register_api_key":
                 api_key = data.get("api_key")
                 if api_key:
@@ -839,7 +851,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
             elif data["type"] == "pong":
                 # Client responded to ping - connection is healthy
                 print(f"💓 Heartbeat acknowledged for {tunnel_id}")
-                    
+
     except WebSocketDisconnect:
         print(f"✗ Tunnel disconnected: {tunnel_id}")
     except Exception as e:
