@@ -64,16 +64,26 @@ async def handle_request(websocket, request_data, local_port, active_streams):
     path = request_data["path"]
     headers = request_data["headers"]
     body = request_data.get("body")
-    
+
     print(f"→ {method} {path}")
-    
+
     # Check if this is a streaming SSE request
     is_sse = method == "GET" and ("/sse" in path or path.endswith("/sse"))
-    
+
     try:
         # Make request to local server
         local_url = f"http://localhost:{local_port}{path}"
-        
+
+        # Fix host/origin mismatch for Next.js Server Actions CSRF check.
+        # The browser set Origin: <public-tunnel-domain>, but httpx will auto-set
+        # Host: localhost:<port>. Next.js compares x-forwarded-host against Origin
+        # and rejects the request if they differ. We preserve the original public
+        # host in x-forwarded-host so Next.js sees a consistent origin.
+        forwarded_headers = dict(headers)
+        original_host = forwarded_headers.get("host", "")
+        if original_host:
+            forwarded_headers["x-forwarded-host"] = original_host
+
         async with httpx.AsyncClient() as client:
             if is_sse:
                 # Handle SSE streaming
@@ -81,7 +91,7 @@ async def handle_request(websocket, request_data, local_port, active_streams):
                 async with client.stream(
                     method=method,
                     url=local_url,
-                    headers=headers,
+                    headers=forwarded_headers,
                     content=body.encode() if body else None,
                     timeout=None  # No timeout for streaming
                 ) as response:
@@ -115,7 +125,7 @@ async def handle_request(websocket, request_data, local_port, active_streams):
                 response = await client.request(
                     method=method,
                     url=local_url,
-                    headers=headers,
+                    headers=forwarded_headers,
                     content=body.encode() if body else None,
                     timeout=30.0
                 )

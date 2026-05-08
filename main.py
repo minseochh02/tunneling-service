@@ -782,7 +782,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         """Send periodic pings to detect connection health"""
         try:
             while True:
-                await asyncio.sleep(30)  # Ping every 30 seconds
+                await asyncio.sleep(20)  # Ping every 20 seconds (reduced from 30s)
                 try:
                     await websocket.send_json({"type": "ping", "timestamp": datetime.now().isoformat()})
                 except Exception as e:
@@ -851,6 +851,11 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
             elif data["type"] == "pong":
                 # Client responded to ping - connection is healthy
                 print(f"💓 Heartbeat acknowledged for {tunnel_id}")
+
+            elif data["type"] == "ping":
+                # Client sent a ping - respond with pong
+                print(f"💓 Heartbeat received from {tunnel_id}, responding with pong")
+                await websocket.send_json({"type": "pong", "timestamp": data.get("timestamp", datetime.now().isoformat())})
 
     except WebSocketDisconnect:
         print(f"✗ Tunnel disconnected: {tunnel_id}")
