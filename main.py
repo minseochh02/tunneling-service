@@ -1341,12 +1341,19 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             print(f"🔀 Routing to coding project: {project_name} → {project_path}")
 
     # Prepare request data to send to client
+    # Inject x-forwarded-host with the public tunnel domain so that frameworks
+    # like Next.js don't reject the request due to host/origin mismatch.
+    # The tunnel client's httpx will override the `host` header to localhost,
+    # but x-forwarded-host takes precedence for origin validation checks.
+    forwarded_headers = dict(request.headers)
+    forwarded_headers["x-forwarded-host"] = request.headers.get("host", "tunneling-service.onrender.com")
+
     request_data = {
         "type": "request",
         "request_id": request_id,
         "method": request.method,
         "path": full_path,
-        "headers": dict(request.headers),
+        "headers": forwarded_headers,
         "query_params": dict(request.query_params),
         "body": body.decode() if body else None,
         "tunnel_id": tunnel_id  # Include tunnel_id for base path construction
