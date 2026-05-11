@@ -1089,19 +1089,28 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             status_code=404,
             content={"error": "Tunnel not found or disconnected"}
         )
-    
-    # ============================================
-    # Session Cookie Authentication (for iframes)
-    # ============================================
-    session_cookie_name = f"egdesk_session_{tunnel_id}"
-    session_token = request.cookies.get(session_cookie_name)
 
-    # Debug logging
-    print(f"🍪 Looking for cookie: {session_cookie_name}")
-    print(f"🍪 All cookies received: {list(request.cookies.keys())}")
-    print(f"🍪 Session token found: {bool(session_token)}")
+    # ============================================
+    # Public pass-through paths (no auth required)
+    # These endpoints handle their own auth internally
+    # ============================================
+    PUBLIC_PATHS = {"kakao/skill", "webhook/start"}
+    if path not in PUBLIC_PATHS:
+        # ============================================
+        # Session Cookie Authentication (for iframes)
+        # ============================================
+        session_cookie_name = f"egdesk_session_{tunnel_id}"
+        session_token = request.cookies.get(session_cookie_name)
 
-    if session_token and session_token in iframe_sessions:
+        # Debug logging
+        print(f"🍪 Looking for cookie: {session_cookie_name}")
+        print(f"🍪 All cookies received: {list(request.cookies.keys())}")
+        print(f"🍪 Session token found: {bool(session_token)}")
+    else:
+        print(f"🔓 Public path bypass: /{path} — skipping tunnel auth")
+        session_token = None
+
+    if path not in PUBLIC_PATHS and session_token and session_token in iframe_sessions:
         session_data = iframe_sessions[session_token]
 
         # Check if session expired
@@ -1159,7 +1168,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     # ============================================
     # API Key Authentication (Apps Script / service accounts)
     # ============================================
-    elif (api_key_header := request.headers.get("X-Api-Key")):
+    elif path not in PUBLIC_PATHS and (api_key_header := request.headers.get("X-Api-Key")):
         stored_key = tunnel_api_keys.get(tunnel_id)
         if not stored_key or stored_key != api_key_header:
             return JSONResponse(
@@ -1167,7 +1176,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                 content={"error": "Unauthorized", "message": "Invalid API key"}
             )
         print(f"🔑 API key auth granted for tunnel: {tunnel_id}")
-    else:
+    elif path not in PUBLIC_PATHS:
         # ============================================
         # OAuth Authentication & Authorization
         # ============================================
