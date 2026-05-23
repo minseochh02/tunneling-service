@@ -1086,6 +1086,38 @@ async def authenticate_session(tunnel_id: str, request: Request, response: Respo
             }
         )
 
+@app.post("/t/{tunnel_id}/kakao/store-answer")
+async def store_kakao_answer(tunnel_id: str, request: Request):
+    """Store an AI answer in Supabase for later retrieval via 'ㅇ' command"""
+    try:
+        body = await request.json()
+        user_key = body.get("user_key")
+        answer_text = body.get("answer_text")
+        
+        if not user_key or not answer_text:
+            return JSONResponse(status_code=400, content={"error": "Missing user_key or answer_text"})
+
+        # Get current description
+        server_data = supabase.table("mcp_servers").select("description").eq("server_key", tunnel_id).single().execute()
+        
+        try:
+            desc_json = json.loads(server_data.data.get("description", "{}"))
+        except:
+            desc_json = {}
+            
+        answers = desc_json.get("kakao_answers", {})
+        answers[user_key] = answer_text
+        desc_json["kakao_answers"] = answers
+        
+        # Update Supabase
+        supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("server_key", tunnel_id).execute()
+        
+        print(f"💾 Stored Kakao answer for {user_key} in Supabase")
+        return {"success": True}
+    except Exception as e:
+        print(f"❌ Failed to store Kakao answer: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 @app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def tunnel_request(tunnel_id: str, path: str, request: Request):
     """Public endpoint - forwards requests through tunnel with OAuth authentication"""
@@ -1125,8 +1157,49 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         )
 
     # ============================================
+    # Intercept KakaoTalk 'ㅇ' command for fast retrieval
+    # ============================================
+    if path == "kakao/skill" and request.method == "POST":
+        try:
+            body = await request.json()
+            utterance = (body.get("userRequest", {}).get("utterance", "")).strip()
+            user_key = (
+                body.get("userRequest", {}).get("user", {}).get("properties", {}).get("botUserKey") or
+                body.get("userRequest", {}).get("user", {}).get("properties", {}).get("plusfriendUserKey") or
+                body.get("userRequest", {}).get("user", {}).get("id") or
+                "unknown"
+            )
+
+            if utterance in ["ㅇ", "o", "어", "ㅇㅇ"]:
+                print(f"🎯 Intercepted 'ㅇ' command for user: {user_key}")
+                # Check Supabase for stored answer (using mcp_servers.description as a temp store)
+                server_data = supabase.table("mcp_servers").select("description").eq("server_key", tunnel_id).single().execute()
+                if server_data.data:
+                    try:
+                        desc_json = json.loads(server_data.data.get("description", "{}"))
+                        answers = desc_json.get("kakao_answers", {})
+                        if user_key in answers:
+                            answer_text = answers.pop(user_key)
+                            # Update DB to remove the retrieved answer
+                            supabase.table("mcp_servers").update({"description": json.dumps({"kakao_answers": answers})}).eq("server_key", tunnel_id).execute()
+                            
+                            return JSONResponse(
+                                status_code=200,
+                                content={
+                                    "version": "2.0",
+                                    "template": { "outputs": [{ "simpleText": { "text": answer_text } }] }
+                                }
+                            )
+                    except:
+                        pass
+                
+                # If not found in DB, we'll let it fall through to the local app (which might have it in memory)
+                print(f"ℹ️ Answer not found in Supabase for {user_key}, forwarding to local app...")
+        except Exception as e:
+            print(f"⚠️ Kakao intercept error: {e}")
+
+    # ============================================
     # Public pass-through paths (no auth required)
-    # These endpoints handle their own auth internally
     # ============================================
     PUBLIC_PATHS = {"kakao/skill", "webhook/start"}
     if path not in PUBLIC_PATHS:
