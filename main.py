@@ -850,7 +850,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
                     # Store the API key in the description JSON to avoid overwriting the server_key slug
                     try:
                         # Find server by server_key OR name (slug) to be resilient
-                        server_data = supabase.table("mcp_servers").select("description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
+                        server_data = supabase.table("mcp_servers").select("id, description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
                         
                         if server_data.data:
                             existing_row = server_data.data[0]
@@ -1141,17 +1141,10 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             }
         )
     
-    # Check if tunnel exists locally
-    if tunnel_id not in active_tunnels:
-        print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
-        return JSONResponse(
-            status_code=404,
-            content={"error": "Tunnel not found or disconnected"}
-        )
-
     # ============================================
     # Intercept KakaoTalk 'ㅇ' command for fast retrieval
     # ============================================
+    # This is handled BEFORE the local tunnel check so it works across instances
     if path == "kakao/skill" and request.method == "POST":
         try:
             body = await request.json()
@@ -1192,6 +1185,14 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                 print(f"ℹ️ Answer not found in Supabase for {user_key}, forwarding to local app...")
         except Exception as e:
             print(f"⚠️ Kakao intercept error: {e}")
+
+    # Check if tunnel exists locally
+    if tunnel_id not in active_tunnels:
+        print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
+        return JSONResponse(
+            status_code=404,
+            content={"error": "Tunnel not found or disconnected"}
+        )
 
     # ============================================
     # Public pass-through paths (no auth required)
