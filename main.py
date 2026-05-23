@@ -855,9 +855,21 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
                 api_key = data.get("api_key")
                 if api_key:
                     # Update Supabase instead of local memory
-                    # Using server_key as the column for now, but ideally this should be a dedicated 'api_key' column
-                    supabase.table("mcp_servers").update({"server_key": api_key}).eq("server_key", tunnel_id).execute()
-                    print(f"🔑 API key registered in Supabase for tunnel: {tunnel_id}")
+                    # Store the API key in the description JSON to avoid overwriting the server_key slug
+                    try:
+                        server_data = supabase.table("mcp_servers").select("description").eq("server_key", tunnel_id).single().execute()
+                        desc_json = {}
+                        if server_data.data:
+                            try:
+                                desc_json = json.loads(server_data.data.get("description", "{}"))
+                            except:
+                                desc_json = {"raw_description": server_data.data.get("description")}
+                        
+                        desc_json["api_key"] = api_key
+                        supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("server_key", tunnel_id).execute()
+                        print(f"🔑 API key registered in Supabase description for tunnel: {tunnel_id}")
+                    except Exception as e:
+                        print(f"❌ Failed to register API key in Supabase: {e}")
 
             elif data["type"] == "pong":
                 # Client responded to ping - connection is healthy
@@ -1100,10 +1112,12 @@ async def store_kakao_answer(tunnel_id: str, request: Request):
         # Get current description
         server_data = supabase.table("mcp_servers").select("description").eq("server_key", tunnel_id).single().execute()
         
-        try:
-            desc_json = json.loads(server_data.data.get("description", "{}"))
-        except:
-            desc_json = {}
+        desc_json = {}
+        if server_data.data:
+            try:
+                desc_json = json.loads(server_data.data.get("description", "{}"))
+            except:
+                desc_json = {"raw_description": server_data.data.get("description")}
             
         answers = desc_json.get("kakao_answers", {})
         answers[user_key] = answer_text
@@ -1276,16 +1290,26 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     # API Key Authentication (Apps Script / service accounts)
     # ============================================
     elif path not in PUBLIC_PATHS and (api_key_header := request.headers.get("X-Api-Key")):
-        # Query Supabase for the key instead of relying on local memory
-        server_check = supabase.table("mcp_servers").select("server_key").eq("server_key", tunnel_id).single().execute()
-        stored_key = server_check.data.get("server_key") if server_check.data else None
-        
-        if not stored_key or stored_key != api_key_header:
-            return JSONResponse(
-                status_code=401,
-                content={"error": "Unauthorized", "message": "Invalid API key"}
-            )
-        print(f"🔑 API key auth granted via Supabase for tunnel: {tunnel_id}")
+        # Query Supabase for the key stored in the description JSON
+        try:
+            server_check = supabase.table("mcp_servers").select("description").eq("server_key", tunnel_id).single().execute()
+            stored_key = None
+            if server_check.data:
+                try:
+                    desc_json = json.loads(server_check.data.get("description", "{}"))
+                    stored_key = desc_json.get("api_key")
+                except:
+                    pass
+            
+            if not stored_key or stored_key != api_key_header:
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "Unauthorized", "message": "Invalid API key"}
+                )
+            print(f"🔑 API key auth granted via Supabase description for tunnel: {tunnel_id}")
+        except Exception as e:
+            print(f"⚠️ API key check failed: {e}")
+            return JSONResponse(status_code=500, content={"error": "Authentication check failed"})
     elif path not in PUBLIC_PATHS:
         # ============================================
         # OAuth Authentication & Authorization
