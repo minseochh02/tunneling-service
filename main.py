@@ -49,7 +49,7 @@ app.add_middleware(
 
 # Store active tunnel connections
 active_tunnels = {}  # {tunnel_id: websocket}
-tunnel_api_keys = {}  # {tunnel_id: api_key} - registered via WebSocket at connect time
+# tunnel_api_keys = {}  # REMOVED: Now stored in Supabase 'mcp_servers' table
 pending_requests = {}  # {request_id: asyncio.Future}
 streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 
@@ -766,6 +766,15 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
             pass
         print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
     
+    # Update status to online in Supabase
+    try:
+        supabase.table("mcp_servers").update({
+            "status": "online",
+            "updated_at": datetime.now().isoformat()
+        }).eq("server_key", tunnel_id).execute()
+    except Exception as e:
+        print(f"⚠️ Failed to update server status to online: {e}")
+
     active_tunnels[tunnel_id] = websocket
     
     print(f"✓ Tunnel established: {tunnel_id} (server: {server_data.get('name')})")
@@ -845,8 +854,10 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
             elif data.get("type") == "register_api_key":
                 api_key = data.get("api_key")
                 if api_key:
-                    tunnel_api_keys[tunnel_id] = api_key
-                    print(f"🔑 API key registered for tunnel: {tunnel_id}")
+                    # Update Supabase instead of local memory
+                    # Using server_key as the column for now, but ideally this should be a dedicated 'api_key' column
+                    supabase.table("mcp_servers").update({"server_key": api_key}).eq("server_key", tunnel_id).execute()
+                    print(f"🔑 API key registered in Supabase for tunnel: {tunnel_id}")
 
             elif data["type"] == "pong":
                 # Client responded to ping - connection is healthy
@@ -866,8 +877,15 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         heartbeat_task.cancel()
         if tunnel_id in active_tunnels:
             del active_tunnels[tunnel_id]
-        if tunnel_id in tunnel_api_keys:
-            del tunnel_api_keys[tunnel_id]
+        
+        # Update status to offline in Supabase
+        try:
+            supabase.table("mcp_servers").update({
+                "status": "active",
+                "updated_at": datetime.now().isoformat()
+            }).eq("server_key", tunnel_id).execute()
+        except Exception as e:
+            print(f"⚠️ Failed to update server status to offline: {e}")
         
         # Clean up any pending streaming requests for this tunnel
         dead_streams = [req_id for req_id, queue in streaming_requests.items() if req_id.startswith(tunnel_id)]
@@ -1083,8 +1101,24 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             }
         )
     
-    # Check if tunnel exists
+    # Check if tunnel exists locally
     if tunnel_id not in active_tunnels:
+        # Check Supabase to see if it's actually online on another instance
+        try:
+            db_status = supabase.table("mcp_servers").select("status").eq("server_key", tunnel_id).single().execute()
+            if db_status.data and db_status.data.get("status") == "online":
+                print(f"⚠️ Tunnel '{tunnel_id}' is online in DB but not on this instance. (Multi-instance mismatch)")
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": "Tunnel instance mismatch",
+                        "message": "The tunnel is connected to a different server instance. This happens on Render Free tier during deployments or cold starts. Please retry the request."
+                    }
+                )
+        except Exception as e:
+            print(f"⚠️ DB status check failed: {e}")
+
+        print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
         return JSONResponse(
             status_code=404,
             content={"error": "Tunnel not found or disconnected"}
@@ -1169,13 +1203,16 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     # API Key Authentication (Apps Script / service accounts)
     # ============================================
     elif path not in PUBLIC_PATHS and (api_key_header := request.headers.get("X-Api-Key")):
-        stored_key = tunnel_api_keys.get(tunnel_id)
+        # Query Supabase for the key instead of relying on local memory
+        server_check = supabase.table("mcp_servers").select("server_key").eq("server_key", tunnel_id).single().execute()
+        stored_key = server_check.data.get("server_key") if server_check.data else None
+        
         if not stored_key or stored_key != api_key_header:
             return JSONResponse(
                 status_code=401,
                 content={"error": "Unauthorized", "message": "Invalid API key"}
             )
-        print(f"🔑 API key auth granted for tunnel: {tunnel_id}")
+        print(f"🔑 API key auth granted via Supabase for tunnel: {tunnel_id}")
     elif path not in PUBLIC_PATHS:
         # ============================================
         # OAuth Authentication & Authorization
