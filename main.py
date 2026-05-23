@@ -753,8 +753,9 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
     
     print(f"🔌 Tunnel connection from IP: {resolved_ip} for server '{name}'")
     
-    # Use server_key as tunnel_id if available, otherwise use name
-    tunnel_id = server_data.get("server_key") or name
+    # Use the requested name (slug) as the tunnel_id for consistency with HTTP routes
+    # even if the server_key in DB was accidentally overwritten with a UUID.
+    tunnel_id = name
     
     # Check if tunnel with this ID already exists
     if tunnel_id in active_tunnels:
@@ -766,18 +767,9 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
             pass
         print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
     
-    # Update status to online in Supabase
-    try:
-        supabase.table("mcp_servers").update({
-            "status": "online",
-            "updated_at": datetime.now().isoformat()
-        }).eq("server_key", tunnel_id).execute()
-    except Exception as e:
-        print(f"⚠️ Failed to update server status to online: {e}")
-
     active_tunnels[tunnel_id] = websocket
     
-    print(f"✓ Tunnel established: {tunnel_id} (server: {server_data.get('name')})")
+    print(f"✓ Tunnel established: {tunnel_id} (display name: {server_data.get('name')})")
     
     # Send tunnel info to client
     await websocket.send_json({
@@ -857,17 +849,20 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
                     # Update Supabase instead of local memory
                     # Store the API key in the description JSON to avoid overwriting the server_key slug
                     try:
-                        server_data = supabase.table("mcp_servers").select("description").eq("server_key", tunnel_id).single().execute()
-                        desc_json = {}
-                        if server_data.data:
-                            try:
-                                desc_json = json.loads(server_data.data.get("description", "{}"))
-                            except:
-                                desc_json = {"raw_description": server_data.data.get("description")}
+                        # Find server by server_key OR name (slug) to be resilient
+                        server_data = supabase.table("mcp_servers").select("description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
                         
-                        desc_json["api_key"] = api_key
-                        supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("server_key", tunnel_id).execute()
-                        print(f"🔑 API key registered in Supabase description for tunnel: {tunnel_id}")
+                        if server_data.data:
+                            existing_row = server_data.data[0]
+                            desc_json = {}
+                            try:
+                                desc_json = json.loads(existing_row.get("description", "{}"))
+                            except:
+                                desc_json = {"raw_description": existing_row.get("description")}
+                            
+                            desc_json["api_key"] = api_key
+                            supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("id", existing_row["id"]).execute()
+                            print(f"🔑 API key registered in Supabase for tunnel: {tunnel_id}")
                     except Exception as e:
                         print(f"❌ Failed to register API key in Supabase: {e}")
 
@@ -889,15 +884,6 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         heartbeat_task.cancel()
         if tunnel_id in active_tunnels:
             del active_tunnels[tunnel_id]
-        
-        # Update status to offline in Supabase
-        try:
-            supabase.table("mcp_servers").update({
-                "status": "active",
-                "updated_at": datetime.now().isoformat()
-            }).eq("server_key", tunnel_id).execute()
-        except Exception as e:
-            print(f"⚠️ Failed to update server status to offline: {e}")
         
         # Clean up any pending streaming requests for this tunnel
         dead_streams = [req_id for req_id, queue in streaming_requests.items() if req_id.startswith(tunnel_id)]
@@ -1110,21 +1096,29 @@ async def store_kakao_answer(tunnel_id: str, request: Request):
             return JSONResponse(status_code=400, content={"error": "Missing user_key or answer_text"})
 
         # Get current description
-        server_data = supabase.table("mcp_servers").select("description").eq("server_key", tunnel_id).single().execute()
+        # Find server by server_key OR name (slug) to be resilient
+        server_data = supabase.table("mcp_servers").select("id, description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
         
         desc_json = {}
+        server_id = None
         if server_data.data:
+            existing_row = server_data.data[0]
+            server_id = existing_row["id"]
             try:
-                desc_json = json.loads(server_data.data.get("description", "{}"))
+                desc_json = json.loads(existing_row.get("description", "{}"))
             except:
-                desc_json = {"raw_description": server_data.data.get("description")}
+                desc_json = {"raw_description": existing_row.get("description")}
             
         answers = desc_json.get("kakao_answers", {})
         answers[user_key] = answer_text
         desc_json["kakao_answers"] = answers
         
         # Update Supabase
-        supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("server_key", tunnel_id).execute()
+        if server_id:
+            supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("id", server_id).execute()
+        else:
+            # Fallback to server_key if ID not found (shouldn't happen)
+            supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("server_key", tunnel_id).execute()
         
         print(f"💾 Stored Kakao answer for {user_key} in Supabase")
         return {"success": True}
@@ -1149,21 +1143,6 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     
     # Check if tunnel exists locally
     if tunnel_id not in active_tunnels:
-        # Check Supabase to see if it's actually online on another instance
-        try:
-            db_status = supabase.table("mcp_servers").select("status").eq("server_key", tunnel_id).single().execute()
-            if db_status.data and db_status.data.get("status") == "online":
-                print(f"⚠️ Tunnel '{tunnel_id}' is online in DB but not on this instance. (Multi-instance mismatch)")
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": "Tunnel instance mismatch",
-                        "message": "The tunnel is connected to a different server instance. This happens on Render Free tier during deployments or cold starts. Please retry the request."
-                    }
-                )
-        except Exception as e:
-            print(f"⚠️ DB status check failed: {e}")
-
         print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
         return JSONResponse(
             status_code=404,
@@ -1187,15 +1166,17 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             if utterance in ["ㅇ", "o", "어", "ㅇㅇ"]:
                 print(f"🎯 Intercepted 'ㅇ' command for user: {user_key}")
                 # Check Supabase for stored answer (using mcp_servers.description as a temp store)
-                server_data = supabase.table("mcp_servers").select("description").eq("server_key", tunnel_id).single().execute()
+                # Find server by server_key OR name (slug) to be resilient
+                server_data = supabase.table("mcp_servers").select("id, description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
                 if server_data.data:
                     try:
-                        desc_json = json.loads(server_data.data.get("description", "{}"))
+                        existing_row = server_data.data[0]
+                        desc_json = json.loads(existing_row.get("description", "{}"))
                         answers = desc_json.get("kakao_answers", {})
                         if user_key in answers:
                             answer_text = answers.pop(user_key)
                             # Update DB to remove the retrieved answer
-                            supabase.table("mcp_servers").update({"description": json.dumps({"kakao_answers": answers})}).eq("server_key", tunnel_id).execute()
+                            supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("id", existing_row["id"]).execute()
                             
                             return JSONResponse(
                                 status_code=200,
@@ -1292,11 +1273,12 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     elif path not in PUBLIC_PATHS and (api_key_header := request.headers.get("X-Api-Key")):
         # Query Supabase for the key stored in the description JSON
         try:
-            server_check = supabase.table("mcp_servers").select("description").eq("server_key", tunnel_id).single().execute()
+            # Find server by server_key OR name (slug) to be resilient
+            server_check = supabase.table("mcp_servers").select("description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
             stored_key = None
             if server_check.data:
                 try:
-                    desc_json = json.loads(server_check.data.get("description", "{}"))
+                    desc_json = json.loads(server_check.data[0].get("description", "{}"))
                     stored_key = desc_json.get("api_key")
                 except:
                     pass
@@ -1306,7 +1288,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                     status_code=401,
                     content={"error": "Unauthorized", "message": "Invalid API key"}
                 )
-            print(f"🔑 API key auth granted via Supabase description for tunnel: {tunnel_id}")
+            print(f"🔑 API key auth granted via Supabase for tunnel: {tunnel_id}")
         except Exception as e:
             print(f"⚠️ API key check failed: {e}")
             return JSONResponse(status_code=500, content={"error": "Authentication check failed"})
