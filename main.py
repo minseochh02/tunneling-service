@@ -1084,48 +1084,6 @@ async def authenticate_session(tunnel_id: str, request: Request, response: Respo
             }
         )
 
-@app.post("/t/{tunnel_id}/kakao/store-answer")
-async def store_kakao_answer(tunnel_id: str, request: Request):
-    """Store an AI answer in Supabase for later retrieval via 'ㅇ' command"""
-    try:
-        body = await request.json()
-        user_key = body.get("user_key")
-        answer_text = body.get("answer_text")
-        
-        if not user_key or not answer_text:
-            return JSONResponse(status_code=400, content={"error": "Missing user_key or answer_text"})
-
-        # Get current description
-        # Find server by server_key OR name (slug) to be resilient
-        server_data = supabase.table("mcp_servers").select("id, description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
-        
-        desc_json = {}
-        server_id = None
-        if server_data.data:
-            existing_row = server_data.data[0]
-            server_id = existing_row["id"]
-            try:
-                desc_json = json.loads(existing_row.get("description", "{}"))
-            except:
-                desc_json = {"raw_description": existing_row.get("description")}
-            
-        answers = desc_json.get("kakao_answers", {})
-        answers[user_key] = answer_text
-        desc_json["kakao_answers"] = answers
-        
-        # Update Supabase
-        if server_id:
-            supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("id", server_id).execute()
-        else:
-            # Fallback to server_key if ID not found (shouldn't happen)
-            supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("server_key", tunnel_id).execute()
-        
-        print(f"💾 Stored Kakao answer for {user_key} in Supabase")
-        return {"success": True}
-    except Exception as e:
-        print(f"❌ Failed to store Kakao answer: {e}")
-        return JSONResponse(status_code=500, content={"error": str(e)})
-
 @app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def tunnel_request(tunnel_id: str, path: str, request: Request):
     """Public endpoint - forwards requests through tunnel with OAuth authentication"""
@@ -1141,51 +1099,6 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             }
         )
     
-    # ============================================
-    # Intercept KakaoTalk 'ㅇ' command for fast retrieval
-    # ============================================
-    # This is handled BEFORE the local tunnel check so it works across instances
-    if path == "kakao/skill" and request.method == "POST":
-        try:
-            body = await request.json()
-            utterance = (body.get("userRequest", {}).get("utterance", "")).strip()
-            user_key = (
-                body.get("userRequest", {}).get("user", {}).get("properties", {}).get("botUserKey") or
-                body.get("userRequest", {}).get("user", {}).get("properties", {}).get("plusfriendUserKey") or
-                body.get("userRequest", {}).get("user", {}).get("id") or
-                "unknown"
-            )
-
-            if utterance in ["ㅇ", "o", "어", "ㅇㅇ"]:
-                print(f"🎯 Intercepted 'ㅇ' command for user: {user_key}")
-                # Check Supabase for stored answer (using mcp_servers.description as a temp store)
-                # Find server by server_key OR name (slug) to be resilient
-                server_data = supabase.table("mcp_servers").select("id, description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
-                if server_data.data:
-                    try:
-                        existing_row = server_data.data[0]
-                        desc_json = json.loads(existing_row.get("description", "{}"))
-                        answers = desc_json.get("kakao_answers", {})
-                        if user_key in answers:
-                            answer_text = answers.pop(user_key)
-                            # Update DB to remove the retrieved answer
-                            supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("id", existing_row["id"]).execute()
-                            
-                            return JSONResponse(
-                                status_code=200,
-                                content={
-                                    "version": "2.0",
-                                    "template": { "outputs": [{ "simpleText": { "text": answer_text } }] }
-                                }
-                            )
-                    except:
-                        pass
-                
-                # If not found in DB, we'll let it fall through to the local app (which might have it in memory)
-                print(f"ℹ️ Answer not found in Supabase for {user_key}, forwarding to local app...")
-        except Exception as e:
-            print(f"⚠️ Kakao intercept error: {e}")
-
     # Check if tunnel exists locally
     if tunnel_id not in active_tunnels:
         print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
