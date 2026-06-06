@@ -57,6 +57,10 @@ streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 # {session_token: {user_id, user_email, tunnel_id, created_at, expires_at}}
 iframe_sessions = {}
 
+# Public access flags — tunnels marked public skip all auth
+# Populated from mcp_servers.description.public_access when tunnel connects
+tunnel_public_flags = {}  # {tunnel_id: bool}
+
 def verify_ip_ownership(client_ip: str, stored_ip_hash: str, stored_salt: str = None) -> bool:
     """
     LEGACY: Verify that the client IP matches the stored owner IP.
@@ -768,7 +772,21 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
     
     active_tunnels[tunnel_id] = websocket
-    
+
+    # Load public_access setting from mcp_servers.description
+    try:
+        desc_raw = server_data.get("description", "{}")
+        desc_json = json.loads(desc_raw) if desc_raw else {}
+        is_public = bool(desc_json.get("public_access", False))
+        tunnel_public_flags[tunnel_id] = is_public
+        if is_public:
+            print(f"🌍 Tunnel {tunnel_id} is public — auth skipped for all visitors")
+        else:
+            print(f"🔒 Tunnel {tunnel_id} is private — auth required")
+    except Exception as e:
+        print(f"⚠️ Could not read public_access for {tunnel_id}: {e}")
+        tunnel_public_flags[tunnel_id] = False
+
     print(f"✓ Tunnel established: {tunnel_id} (display name: {server_data.get('name')})")
     
     # Send tunnel info to client
@@ -884,7 +902,9 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         heartbeat_task.cancel()
         if tunnel_id in active_tunnels:
             del active_tunnels[tunnel_id]
-        
+        if tunnel_id in tunnel_public_flags:
+            del tunnel_public_flags[tunnel_id]
+
         # Clean up any pending streaming requests for this tunnel
         dead_streams = [req_id for req_id, queue in streaming_requests.items() if req_id.startswith(tunnel_id)]
         for req_id in dead_streams:
@@ -1084,6 +1104,55 @@ async def authenticate_session(tunnel_id: str, request: Request, response: Respo
             }
         )
 
+@app.put("/t/{tunnel_id}/access-mode")
+async def set_tunnel_access_mode(tunnel_id: str, request: Request):
+    """
+    Set public/private access mode for a tunnel.
+    Only the tunnel owner (verified via Supabase Bearer token) can change this.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+
+    public_access = bool(body.get("public", False))
+
+    # Verify the requester is the tunnel owner
+    server_check = supabase.table("mcp_servers").select("*").or_(
+        f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
+    ).execute()
+
+    if not server_check.data:
+        return JSONResponse(status_code=404, content={"error": "Tunnel not found"})
+
+    server_data = server_check.data[0]
+    is_owner, err = verify_ownership(request, server_data)
+    if not is_owner:
+        return JSONResponse(status_code=403, content={"error": err or "Forbidden"})
+
+    # Update description JSON in Supabase
+    try:
+        desc_json = {}
+        try:
+            desc_json = json.loads(server_data.get("description", "{}") or "{}")
+        except Exception:
+            pass
+        desc_json["public_access"] = public_access
+        supabase.table("mcp_servers").update({
+            "description": json.dumps(desc_json)
+        }).eq("id", server_data["id"]).execute()
+    except Exception as e:
+        print(f"❌ Failed to update access mode in Supabase: {e}")
+        return JSONResponse(status_code=500, content={"error": "Failed to persist access mode"})
+
+    # Update in-memory flag (effective immediately for connected tunnels)
+    tunnel_public_flags[tunnel_id] = public_access
+    mode = "public" if public_access else "private"
+    print(f"🔧 Tunnel {tunnel_id} access mode set to {mode}")
+
+    return JSONResponse(content={"success": True, "tunnel_id": tunnel_id, "public": public_access})
+
+
 @app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def tunnel_request(tunnel_id: str, path: str, request: Request):
     """Public endpoint - forwards requests through tunnel with OAuth authentication"""
@@ -1108,10 +1177,18 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         )
 
     # ============================================
+    # Public access check — owner can mark tunnel as fully public
+    # ============================================
+    is_public_tunnel = tunnel_public_flags.get(tunnel_id, False)
+
+    # ============================================
     # Public pass-through paths (no auth required)
     # ============================================
     PUBLIC_PATHS = {"kakao/skill", "webhook/start"}
-    if path not in PUBLIC_PATHS:
+    if is_public_tunnel:
+        print(f"🌍 Public tunnel: {tunnel_id} — skipping auth")
+        session_token = None
+    elif path not in PUBLIC_PATHS:
         # ============================================
         # Session Cookie Authentication (for iframes)
         # ============================================
@@ -1126,7 +1203,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         print(f"🔓 Public path bypass: /{path} — skipping tunnel auth")
         session_token = None
 
-    if path not in PUBLIC_PATHS and session_token and session_token in iframe_sessions:
+    if not is_public_tunnel and path not in PUBLIC_PATHS and session_token and session_token in iframe_sessions:
         session_data = iframe_sessions[session_token]
 
         # Check if session expired
@@ -1184,7 +1261,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     # ============================================
     # API Key Authentication (Apps Script / service accounts)
     # ============================================
-    elif path not in PUBLIC_PATHS and (api_key_header := request.headers.get("X-Api-Key")):
+    elif not is_public_tunnel and path not in PUBLIC_PATHS and (api_key_header := request.headers.get("X-Api-Key")):
         # Query Supabase for the key stored in the description JSON
         try:
             # Find server by server_key OR name (slug) to be resilient
@@ -1206,7 +1283,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         except Exception as e:
             print(f"⚠️ API key check failed: {e}")
             return JSONResponse(status_code=500, content={"error": "Authentication check failed"})
-    elif path not in PUBLIC_PATHS:
+    elif not is_public_tunnel and path not in PUBLIC_PATHS:
         # ============================================
         # OAuth Authentication & Authorization
         # ============================================
@@ -1224,6 +1301,11 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             access_token = request.query_params.get("token")
 
         if not access_token:
+            # Redirect browser visitors to egdesk.cloud for login
+            accept_header = request.headers.get("accept", "")
+            if "text/html" in accept_header:
+                from fastapi.responses import RedirectResponse
+                return RedirectResponse(url="https://egdesk.cloud", status_code=302)
             return JSONResponse(
                 status_code=401,
                 content={
