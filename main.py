@@ -7,6 +7,7 @@ import uuid
 import os
 import hashlib
 import secrets
+import time
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -61,6 +62,19 @@ iframe_sessions = {}
 # Populated from mcp_servers.description.public_access when tunnel connects
 tunnel_public_flags = {}  # {tunnel_id: bool}
 
+# Custom-domain routing cache. Maps hostnames to tunnel IDs to avoid hitting
+# Supabase on every request for user domains like www.example.com.
+domain_route_cache = {}  # {domain: (tunnel_id, timestamp)}
+DOMAIN_ROUTE_CACHE_TTL_SECONDS = 300
+PRIMARY_DOMAINS = {
+    "tunneling-service.onrender.com",
+    "domains.egdesk.cloud",
+    "egdesk.cloud",
+    "www.egdesk.cloud",
+    "localhost",
+    "127.0.0.1",
+}
+
 def verify_ip_ownership(client_ip: str, stored_ip_hash: str, stored_salt: str = None) -> bool:
     """
     LEGACY: Verify that the client IP matches the stored owner IP.
@@ -107,6 +121,68 @@ def get_client_ip(request: Request) -> str:
     return real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
 
 
+def normalize_host(host: str | None) -> str:
+    """Normalize a Host header value to a lowercase hostname without port."""
+    return (host or "").lower().split(":")[0].strip().rstrip(".")
+
+
+def parse_description_json(raw_description) -> dict:
+    """Parse mcp_servers.description while tolerating legacy plain text values."""
+    if isinstance(raw_description, dict):
+        return raw_description
+    if not raw_description:
+        return {}
+    if not isinstance(raw_description, str):
+        return {}
+    try:
+        parsed = json.loads(raw_description)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def clear_domain_route_cache(domain: str | None = None):
+    if domain:
+        domain_route_cache.pop(domain, None)
+    else:
+        domain_route_cache.clear()
+
+
+async def resolve_domain_to_tunnel(domain: str) -> str | None:
+    """Resolve a configured custom domain to a tunnel/server key."""
+    domain = normalize_host(domain)
+    if not domain or domain in PRIMARY_DOMAINS:
+        return None
+
+    cached = domain_route_cache.get(domain)
+    if cached:
+        tunnel_id, timestamp = cached
+        if time.time() - timestamp < DOMAIN_ROUTE_CACHE_TTL_SECONDS:
+            return tunnel_id
+        domain_route_cache.pop(domain, None)
+
+    try:
+        result = supabase.table("mcp_servers") \
+            .select("server_key, description") \
+            .ilike("description", f"%{domain}%") \
+            .execute()
+
+        for row in result.data or []:
+            desc = parse_description_json(row.get("description"))
+            custom_domains = desc.get("custom_domains") or []
+            normalized_domains = {normalize_host(str(item)) for item in custom_domains}
+            if domain in normalized_domains:
+                tunnel_id = row.get("server_key")
+                if tunnel_id:
+                    domain_route_cache[domain] = (tunnel_id, time.time())
+                    print(f"🌐 Custom domain resolved: {domain} → {tunnel_id}")
+                    return tunnel_id
+    except Exception as e:
+        print(f"❌ Domain lookup failed for {domain}: {e}")
+
+    return None
+
+
 def verify_ownership(request: Request, server_data: dict) -> tuple[bool, str | None]:
     """
     Verify server ownership using User ID (preferred) or IP (legacy fallback).
@@ -141,8 +217,50 @@ def verify_ownership(request: Request, server_data: dict) -> tuple[bool, str | N
     
     return False, "Your IP does not match the server owner's IP. If you're the owner, please re-register to update ownership."
 
+async def route_custom_domain_request(path: str, request: Request):
+    """Route a request whose Host header is a configured custom domain."""
+    host = normalize_host(request.headers.get("host"))
+
+    if not host or host in PRIMARY_DOMAINS:
+        return None
+
+    tunnel_id = await resolve_domain_to_tunnel(host)
+    if not tunnel_id:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Domain '{host}' is not configured"},
+        )
+
+    if tunnel_id not in active_tunnels:
+        return JSONResponse(
+            status_code=503,
+            content={"error": f"Server for '{host}' is offline"},
+        )
+
+    display_path = path or ""
+    print(f"🌐 Custom domain request: {host}/{display_path} → {tunnel_id}")
+    return await tunnel_request(tunnel_id, path, request)
+
+
+@app.middleware("http")
+async def custom_domain_middleware(request: Request, call_next):
+    """Route custom-domain HTTP traffic before explicit service endpoints can shadow it."""
+    host = normalize_host(request.headers.get("host"))
+    if host and host not in PRIMARY_DOMAINS:
+        path = request.url.path.lstrip("/")
+        custom_domain_response = await route_custom_domain_request(path, request)
+        if custom_domain_response is not None:
+            return custom_domain_response
+
+    return await call_next(request)
+
+
 @app.get("/")
-async def root():
+async def root(request: Request):
+    custom_domain_response = await route_custom_domain_request("", request)
+    if custom_domain_response is not None:
+        return custom_domain_response
+
     return {
         "service": "Tunnel Service",
         "active_tunnels": len(active_tunnels),
@@ -1598,3 +1716,12 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                 status_code=500,
                 content={"error": str(e)}
             )
+
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+async def custom_domain_request(path: str, request: Request):
+    """Catch-all for custom domains. Reads Host and routes to the owning tunnel."""
+    custom_domain_response = await route_custom_domain_request(path, request)
+    if custom_domain_response is not None:
+        return custom_domain_response
+    return JSONResponse(status_code=404, content={"error": "Not found"})
+
