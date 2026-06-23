@@ -8,6 +8,7 @@ import os
 import hashlib
 import secrets
 import time
+import httpx
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -19,6 +20,8 @@ load_dotenv()
 # Initialize Supabase client
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+RENDER_API_KEY = os.getenv("RENDER_API_KEY")
+RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID")
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
@@ -183,6 +186,65 @@ async def resolve_domain_to_tunnel(domain: str) -> str | None:
     return None
 
 
+def normalize_custom_domains(domains) -> list[str]:
+    """Normalize and de-duplicate custom domain hostnames from API input."""
+    normalized = []
+    for domain in domains or []:
+        host = normalize_host(str(domain).replace("https://", "").replace("http://", "").split("/")[0])
+        if not host or host in PRIMARY_DOMAINS or "." not in host:
+            continue
+        if host not in normalized:
+            normalized.append(host)
+    return normalized
+
+
+async def add_custom_domain_to_render(domain: str) -> dict:
+    """Register a custom domain on the Render service so Render can issue SSL."""
+    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
+        return {"domain": domain, "success": False, "skipped": True, "error": "RENDER_API_KEY or RENDER_SERVICE_ID is not configured"}
+
+    url = f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/custom-domains"
+    headers = {
+        "Authorization": f"Bearer {RENDER_API_KEY}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(url, headers=headers, json={"name": domain})
+
+        body = None
+        try:
+            body = response.json()
+        except Exception:
+            body = response.text
+
+        # Render may return a conflict/client error if the domain already exists.
+        # Treat text containing "already" as non-fatal so retries are idempotent.
+        if response.status_code in (200, 201, 202):
+            return {"domain": domain, "success": True, "status_code": response.status_code, "response": body}
+        if response.status_code in (400, 409) and "already" in str(body).lower():
+            return {"domain": domain, "success": True, "already_exists": True, "status_code": response.status_code, "response": body}
+
+        return {"domain": domain, "success": False, "status_code": response.status_code, "error": body}
+    except Exception as e:
+        return {"domain": domain, "success": False, "error": str(e)}
+
+
+def merge_custom_domains_description(raw_description, domains: list[str]) -> str:
+    desc = parse_description_json(raw_description)
+    existing = desc.get("custom_domains") or []
+    merged = []
+    for domain in [*existing, *domains]:
+        host = normalize_host(str(domain))
+        if host and host not in merged:
+            merged.append(host)
+    desc["custom_domains"] = merged
+    desc["custom_domain_updated_at"] = datetime.utcnow().isoformat()
+    return json.dumps(desc)
+
+
 def verify_ownership(request: Request, server_data: dict) -> tuple[bool, str | None]:
     """
     Verify server ownership using User ID (preferred) or IP (legacy fallback).
@@ -267,6 +329,57 @@ async def root(request: Request):
         "tunnel_ids": list(active_tunnels.keys()),
         "instructions": "Connect client via WebSocket to /tunnel/connect"
     }
+
+@app.post("/custom-domains/register")
+async def register_custom_domains(request: Request):
+    """Register custom domains for a tunnel and ask Render to provision SSL."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+
+    server_key = str(body.get("server_key") or "").strip()
+    domains = normalize_custom_domains(body.get("domains") or [])
+
+    if not server_key:
+        return JSONResponse(status_code=400, content={"error": "server_key is required"})
+    if not domains:
+        return JSONResponse(status_code=400, content={"error": "At least one valid domain is required"})
+
+    try:
+        server_result = supabase.table("mcp_servers").select("*").or_(
+            f"server_key.eq.{server_key},name.eq.{server_key}"
+        ).execute()
+        server_data = (server_result.data or [None])[0]
+        if not server_data:
+            return JSONResponse(status_code=404, content={"error": f"Server '{server_key}' not found"})
+
+        is_owner, ownership_error = verify_ownership(request, server_data)
+        if not is_owner:
+            return JSONResponse(status_code=403, content={"error": ownership_error or "Forbidden"})
+
+        updated_description = merge_custom_domains_description(server_data.get("description"), domains)
+        supabase.table("mcp_servers").update({"description": updated_description}).eq("id", server_data["id"]).execute()
+
+        for domain in domains:
+            clear_domain_route_cache(domain)
+
+        render_results = []
+        for domain in domains:
+            result = await add_custom_domain_to_render(domain)
+            render_results.append(result)
+
+        return {
+            "success": True,
+            "server_key": server_data.get("server_key"),
+            "domains": domains,
+            "render_configured": all(item.get("success") for item in render_results),
+            "render_results": render_results,
+        }
+    except Exception as e:
+        print(f"❌ Failed to register custom domains: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 @app.post("/register")
 async def register_mcp(request: Request):
