@@ -455,14 +455,9 @@ async def register_custom_domains(request: Request):
         for domain in domains:
             clear_domain_route_cache(domain)
 
-        # Only register the bare (non-www) domain with Render to save costs.
-        # www.* should be handled via DNS redirect (CNAME + redirect rule),
-        # not as a separate Render custom domain.
+        # Register all domains (bare + www) with Render for SSL certs
         render_results = []
         for domain in domains:
-            if domain.startswith("www."):
-                render_results.append({"domain": domain, "success": True, "skipped_www": True})
-                continue
             result = await add_custom_domain_to_render(domain)
             render_results.append(result)
 
