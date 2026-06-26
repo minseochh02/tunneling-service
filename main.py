@@ -166,7 +166,7 @@ async def resolve_domain_to_tunnel(domain: str) -> str | None:
 
     try:
         result = supabase.table("mcp_servers") \
-            .select("server_key, description") \
+            .select("server_key, name, description") \
             .ilike("description", f"%{domain}%") \
             .execute()
 
@@ -175,7 +175,8 @@ async def resolve_domain_to_tunnel(domain: str) -> str | None:
             custom_domains = desc.get("custom_domains") or []
             normalized_domains = {normalize_host(str(item)) for item in custom_domains}
             if domain in normalized_domains:
-                tunnel_id = row.get("server_key")
+                # Prefer name (slug) over server_key since active_tunnels is keyed by name
+                tunnel_id = row.get("name") or row.get("server_key")
                 if tunnel_id:
                     domain_route_cache[domain] = (tunnel_id, time.time())
                     print(f"🌐 Custom domain resolved: {domain} → {tunnel_id}")
