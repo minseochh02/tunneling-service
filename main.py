@@ -179,7 +179,7 @@ async def resolve_domain_to_tunnel(domain: str) -> str | None:
                 tunnel_id = row.get("name") or row.get("server_key")
                 if tunnel_id:
                     domain_route_cache[domain] = (tunnel_id, time.time())
-                    print(f"🌐 Custom domain resolved: {domain} → {tunnel_id}")
+                    print(f"🌐 Custom domain resolved: {domain} → tunnel_id='{tunnel_id}' (name='{row.get('name')}', server_key='{row.get('server_key')}')")
                     return tunnel_id
     except Exception as e:
         print(f"❌ Domain lookup failed for {domain}: {e}")
@@ -295,6 +295,7 @@ async def route_custom_domain_request(path: str, request: Request):
         )
 
     if tunnel_id not in active_tunnels:
+        print(f"❌ Custom domain '{host}' resolved to tunnel '{tunnel_id}', but it is not in active_tunnels. Active tunnels: {list(active_tunnels.keys())}")
         return JSONResponse(
             status_code=503,
             content={"error": f"Server for '{host}' is offline"},
@@ -311,6 +312,83 @@ async def route_custom_domain_request(path: str, request: Request):
             tunnel_public_flags[tunnel_id] = bool(desc.get("public_access", False))
     except Exception as e:
         print(f"⚠️ Could not load public_access for {tunnel_id}: {e}")
+
+    is_public = tunnel_public_flags.get(tunnel_id, False)
+
+    # ============================================
+    # Custom domain session exchange callback
+    # When egdesk.cloud redirects back with ?__egdesk_session=<token>,
+    # validate the session, set a cookie on this custom domain, and redirect to clean URL.
+    # ============================================
+    session_param = request.query_params.get("__egdesk_session")
+    if session_param and session_param in iframe_sessions:
+        session_data = iframe_sessions[session_param]
+        # Verify session belongs to this tunnel
+        if session_data.get("tunnel_id") == tunnel_id:
+            # Build the clean redirect URL (strip __egdesk_session param)
+            from urllib.parse import urlencode, parse_qs, urlparse
+            raw_host = request.headers.get("host", host)
+            scheme = "https"
+            clean_path = f"/{path}" if path else "/"
+            # Preserve other query params
+            other_params = {k: v for k, v in request.query_params.items() if k != "__egdesk_session"}
+            qs = f"?{urlencode(other_params)}" if other_params else ""
+            clean_url = f"{scheme}://{raw_host}{clean_path}{qs}"
+
+            from fastapi.responses import RedirectResponse
+            response = RedirectResponse(url=clean_url, status_code=302)
+            response.set_cookie(
+                key=f"egdesk_session_{tunnel_id}",
+                value=session_param,
+                httponly=True,
+                secure=True,
+                samesite="lax",  # Lax is fine for same-domain navigation
+                max_age=86400,  # 24 hours
+                domain=host,    # Set on the custom domain
+                path="/",
+            )
+            print(f"🍪 Custom domain session set for {host} → tunnel {tunnel_id}")
+            return response
+
+    # ============================================
+    # Private custom domain auth gate
+    # If the tunnel is private and the request has no valid session cookie,
+    # redirect browser visitors to egdesk.cloud/auth/tunnel-login to authenticate.
+    # ============================================
+    if not is_public:
+        session_cookie_name = f"egdesk_session_{tunnel_id}"
+        session_token = request.cookies.get(session_cookie_name)
+        has_valid_session = (
+            session_token
+            and session_token in iframe_sessions
+            and iframe_sessions[session_token].get("tunnel_id") == tunnel_id
+        )
+
+        # Check session expiry
+        if has_valid_session:
+            expires_at = datetime.fromisoformat(iframe_sessions[session_token]["expires_at"])
+            if datetime.utcnow() > expires_at:
+                del iframe_sessions[session_token]
+                has_valid_session = False
+
+        if not has_valid_session:
+            # Check for API key or Bearer token (non-browser clients)
+            api_key_header = request.headers.get("X-Api-Key")
+            auth_header = request.headers.get("Authorization")
+            if api_key_header or auth_header:
+                # Let tunnel_request handle API key / Bearer auth as normal
+                pass
+            else:
+                # Browser visitor with no auth → redirect to egdesk.cloud login
+                accept_header = request.headers.get("accept", "")
+                if "text/html" in accept_header:
+                    from urllib.parse import quote
+                    raw_host = request.headers.get("host", host)
+                    redirect_url = f"https://{raw_host}/{path}" if path else f"https://{raw_host}/"
+                    login_url = f"https://egdesk.cloud/auth/tunnel-login?redirect={quote(redirect_url)}&tunnel_id={tunnel_id}"
+                    print(f"🔒 Private custom domain {host}: redirecting browser to {login_url}")
+                    from fastapi.responses import RedirectResponse
+                    return RedirectResponse(url=login_url, status_code=302)
 
     display_path = path or ""
     print(f"🌐 Custom domain request: {host}/{display_path} → {tunnel_id}")
@@ -959,7 +1037,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
     
     # Check if server is registered in mcp_servers table (check by server_key or name)
     # Try server_key first, then fallback to name for backwards compatibility
-    existing = supabase.table("mcp_servers").select("id, name, server_key, status, owner_user_id").or_(f"server_key.eq.{name},name.eq.{name}").execute()
+    existing = supabase.table("mcp_servers").select("id, name, server_key, status, owner_user_id, description").or_(f"server_key.eq.{name},name.eq.{name}").execute()
     
     if not existing.data or len(existing.data) == 0:
         await websocket.send_json({
@@ -1348,6 +1426,89 @@ async def authenticate_session(tunnel_id: str, request: Request, response: Respo
             }
         )
 
+@app.post("/t/{tunnel_id}/auth/session-exchange")
+async def session_exchange(tunnel_id: str, request: Request):
+    """
+    Exchange a Supabase access token for a tunnel session token.
+    Used by egdesk.cloud/auth/tunnel-login to create a session that can be
+    passed back to a custom domain via redirect.
+    """
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        return JSONResponse(status_code=401, content={"error": "Missing Bearer token"})
+
+    access_token = auth_header.replace("Bearer ", "")
+
+    try:
+        # Verify token with Supabase
+        user_response = supabase.auth.get_user(access_token)
+        if not user_response or not user_response.user:
+            return JSONResponse(status_code=401, content={"error": "Invalid or expired token"})
+
+        user = user_response.user
+        user_email = user.email
+        user_id = user.id
+
+        # Get server info
+        server = supabase.table("mcp_servers").select("*").or_(
+            f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
+        ).execute()
+        if not server.data:
+            return JSONResponse(status_code=404, content={"error": "Server not found"})
+
+        server_data = server.data[0]
+        server_id = server_data["id"]
+
+        # Check if user is the owner (owners always have access)
+        is_owner = str(server_data.get("owner_user_id")) == str(user_id)
+
+        if not is_owner:
+            # Check permissions
+            permission = supabase.table("mcp_server_permissions").select("*").eq(
+                "server_id", server_id
+            ).eq("allowed_email", user_email).execute()
+
+            if not permission.data:
+                return JSONResponse(status_code=403, content={
+                    "error": "Forbidden",
+                    "message": f"User '{user_email}' does not have permission to access this server."
+                })
+
+            perm_status = permission.data[0].get("status")
+            if perm_status not in ("active", "pending"):
+                return JSONResponse(status_code=403, content={
+                    "error": "Forbidden",
+                    "message": "Your access has been revoked or expired."
+                })
+            permission_id = permission.data[0]["id"]
+        else:
+            permission_id = f"owner-{user_id}"
+
+        # Create session
+        session_token = secrets.token_urlsafe(32)
+        session_data = {
+            "user_id": str(user_id),
+            "user_email": user_email,
+            "tunnel_id": tunnel_id,
+            "server_id": server_id,
+            "permission_id": permission_id,
+            "created_at": datetime.utcnow().isoformat(),
+            "expires_at": (datetime.utcnow() + timedelta(hours=24)).isoformat(),
+        }
+        iframe_sessions[session_token] = session_data
+
+        print(f"✅ Session exchange: {user_email} → tunnel {tunnel_id}")
+        return JSONResponse(content={
+            "success": True,
+            "session_token": session_token,
+            "expires_in": 86400,
+        })
+
+    except Exception as e:
+        print(f"❌ Session exchange error: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
 @app.put("/t/{tunnel_id}/access-mode")
 async def set_tunnel_access_mode(tunnel_id: str, request: Request):
     """
@@ -1545,11 +1706,14 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             access_token = request.query_params.get("token")
 
         if not access_token:
-            # Redirect browser visitors to egdesk.cloud for login
+            # Redirect browser visitors to egdesk.cloud tunnel-login page
             accept_header = request.headers.get("accept", "")
             if "text/html" in accept_header:
                 from fastapi.responses import RedirectResponse
-                return RedirectResponse(url="https://egdesk.cloud", status_code=302)
+                from urllib.parse import quote
+                redirect_url = str(request.url)
+                login_url = f"https://egdesk.cloud/auth/tunnel-login?redirect={quote(redirect_url)}&tunnel_id={tunnel_id}"
+                return RedirectResponse(url=login_url, status_code=302)
             return JSONResponse(
                 status_code=401,
                 content={
