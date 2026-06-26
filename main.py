@@ -300,6 +300,18 @@ async def route_custom_domain_request(path: str, request: Request):
             content={"error": f"Server for '{host}' is offline"},
         )
 
+    # Ensure public_access flag is loaded from DB if not in memory
+    if tunnel_id not in tunnel_public_flags:
+        try:
+            server_result = supabase.table("mcp_servers").select("description").or_(
+                f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
+            ).execute()
+            if server_result.data:
+                desc = parse_description_json(server_result.data[0].get("description"))
+                tunnel_public_flags[tunnel_id] = bool(desc.get("public_access", False))
+        except Exception as e:
+            print(f"⚠️ Could not load public_access for {tunnel_id}: {e}")
+
     display_path = path or ""
     print(f"🌐 Custom domain request: {host}/{display_path} → {tunnel_id}")
     return await tunnel_request(tunnel_id, path, request)
