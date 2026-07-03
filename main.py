@@ -61,9 +61,10 @@ streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 # {session_token: {user_id, user_email, tunnel_id, created_at, expires_at}}
 iframe_sessions = {}
 
-# Public access flags — tunnels marked public skip all auth
-# Populated from mcp_servers.description.public_access when tunnel connects
-tunnel_public_flags = {}  # {tunnel_id: bool}
+# Public access flags — per-project access control
+# Populated from mcp_servers.description when tunnel connects
+# Format: {tunnel_id: {"__default__": bool, "project_name": bool, ...}}
+tunnel_public_flags = {}  # {tunnel_id: {str: bool}}
 
 # Custom-domain routing cache. Maps hostnames to tunnel IDs to avoid hitting
 # Supabase on every request for user domains like www.example.com.
@@ -142,6 +143,42 @@ def parse_description_json(raw_description) -> dict:
         return parsed if isinstance(parsed, dict) else {}
     except Exception:
         return {}
+
+
+def extract_project_from_path(path: str) -> str | None:
+    """Extract project name from a /p/{project_name}/... path."""
+    if path.startswith("p/"):
+        parts = path.split("/", 2)
+        if len(parts) >= 2 and parts[1]:
+            return parts[1]
+    return None
+
+
+def is_project_public(tunnel_id: str, project_name: str | None = None) -> bool:
+    """Check if a specific project (or the tunnel default) is public."""
+    flags = tunnel_public_flags.get(tunnel_id)
+    if flags is None:
+        return False
+    # Backward compat: old code stored a bare bool
+    if isinstance(flags, bool):
+        return flags
+    if project_name:
+        # Per-project flag takes priority, fall back to tunnel default
+        if project_name in flags:
+            return flags[project_name]
+        # Case-insensitive fallback
+        lower = project_name.lower()
+        for key, val in flags.items():
+            if key != "__default__" and key.lower() == lower:
+                return val
+    return flags.get("__default__", False)
+
+
+def load_flags_from_description(desc_json: dict) -> dict:
+    """Build a flags dict from a parsed description JSON."""
+    default_public = bool(desc_json.get("public_access", False))
+    project_access = desc_json.get("project_access") or {}
+    return {"__default__": default_public, **{k: bool(v) for k, v in project_access.items()}}
 
 
 def clear_domain_route_cache(domain: str | None = None):
@@ -301,19 +338,21 @@ async def route_custom_domain_request(path: str, request: Request):
             content={"error": f"Server for '{host}' is offline"},
         )
 
-    # Refresh public_access flag from DB for custom domain requests
-    # (in-memory flag may be stale if access mode changed after tunnel connected)
+    # Refresh per-project access flags from DB for custom domain requests
+    # (in-memory flags may be stale if access mode changed after tunnel connected)
     try:
         server_result = supabase.table("mcp_servers").select("description").or_(
             f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
         ).execute()
         if server_result.data:
             desc = parse_description_json(server_result.data[0].get("description"))
-            tunnel_public_flags[tunnel_id] = bool(desc.get("public_access", False))
+            tunnel_public_flags[tunnel_id] = load_flags_from_description(desc)
     except Exception as e:
-        print(f"⚠️ Could not load public_access for {tunnel_id}: {e}")
+        print(f"⚠️ Could not load access flags for {tunnel_id}: {e}")
 
-    is_public = tunnel_public_flags.get(tunnel_id, False)
+    # Extract project name from the request path to check per-project access
+    request_project = extract_project_from_path(path)
+    is_public = is_project_public(tunnel_id, request_project)
 
     # ============================================
     # Custom domain session exchange callback
@@ -1096,19 +1135,22 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
     
     active_tunnels[tunnel_id] = websocket
 
-    # Load public_access setting from mcp_servers.description
+    # Load per-project access flags from mcp_servers.description
     try:
         desc_raw = server_data.get("description", "{}")
         desc_json = json.loads(desc_raw) if desc_raw else {}
-        is_public = bool(desc_json.get("public_access", False))
-        tunnel_public_flags[tunnel_id] = is_public
-        if is_public:
-            print(f"🌍 Tunnel {tunnel_id} is public — auth skipped for all visitors")
-        else:
-            print(f"🔒 Tunnel {tunnel_id} is private — auth required")
+        flags = load_flags_from_description(desc_json)
+        tunnel_public_flags[tunnel_id] = flags
+        public_projects = [k for k, v in flags.items() if v and k != "__default__"]
+        if flags.get("__default__"):
+            print(f"🌍 Tunnel {tunnel_id} default is public")
+        if public_projects:
+            print(f"🌍 Tunnel {tunnel_id} public projects: {public_projects}")
+        if not flags.get("__default__") and not public_projects:
+            print(f"🔒 Tunnel {tunnel_id} is fully private — auth required")
     except Exception as e:
-        print(f"⚠️ Could not read public_access for {tunnel_id}: {e}")
-        tunnel_public_flags[tunnel_id] = False
+        print(f"⚠️ Could not read access flags for {tunnel_id}: {e}")
+        tunnel_public_flags[tunnel_id] = {"__default__": False}
 
     print(f"✓ Tunnel established: {tunnel_id} (display name: {server_data.get('name')})")
     
@@ -1522,6 +1564,7 @@ async def set_tunnel_access_mode(tunnel_id: str, request: Request):
         return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
 
     public_access = bool(body.get("public", False))
+    project_name = body.get("project")  # Optional: per-project access mode
 
     # Verify the requester is the tunnel owner
     server_check = supabase.table("mcp_servers").select("*").or_(
@@ -1543,7 +1586,16 @@ async def set_tunnel_access_mode(tunnel_id: str, request: Request):
             desc_json = json.loads(server_data.get("description", "{}") or "{}")
         except Exception:
             pass
-        desc_json["public_access"] = public_access
+
+        if project_name:
+            # Per-project access mode
+            project_access = desc_json.get("project_access") or {}
+            project_access[project_name] = public_access
+            desc_json["project_access"] = project_access
+        else:
+            # Tunnel-wide default
+            desc_json["public_access"] = public_access
+
         supabase.table("mcp_servers").update({
             "description": json.dumps(desc_json)
         }).eq("id", server_data["id"]).execute()
@@ -1551,12 +1603,22 @@ async def set_tunnel_access_mode(tunnel_id: str, request: Request):
         print(f"❌ Failed to update access mode in Supabase: {e}")
         return JSONResponse(status_code=500, content={"error": "Failed to persist access mode"})
 
-    # Update in-memory flag (effective immediately for connected tunnels)
-    tunnel_public_flags[tunnel_id] = public_access
-    mode = "public" if public_access else "private"
-    print(f"🔧 Tunnel {tunnel_id} access mode set to {mode}")
+    # Update in-memory flags (effective immediately for connected tunnels)
+    if not isinstance(tunnel_public_flags.get(tunnel_id), dict):
+        tunnel_public_flags[tunnel_id] = {"__default__": False}
+    if project_name:
+        tunnel_public_flags[tunnel_id][project_name] = public_access
+    else:
+        tunnel_public_flags[tunnel_id]["__default__"] = public_access
 
-    return JSONResponse(content={"success": True, "tunnel_id": tunnel_id, "public": public_access})
+    target = f"project '{project_name}'" if project_name else "tunnel default"
+    mode = "public" if public_access else "private"
+    print(f"🔧 Tunnel {tunnel_id} {target} access mode set to {mode}")
+
+    return JSONResponse(content={
+        "success": True, "tunnel_id": tunnel_id, "public": public_access,
+        **({"project": project_name} if project_name else {}),
+    })
 
 
 @app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
@@ -1573,7 +1635,37 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                 "Access-Control-Allow-Headers": "Content-Type, Accept, Authorization, X-Api-Key, X-EGDesk-Project-Id, X-EGDesk-Env",
             }
         )
-    
+
+    # ============================================
+    # Session token from redirect callback
+    # When egdesk.cloud redirects back with ?__egdesk_session=<token>,
+    # validate the session, set a cookie on this tunnel path, and redirect to clean URL.
+    # ============================================
+    session_param = request.query_params.get("__egdesk_session")
+    if session_param and session_param in iframe_sessions:
+        session_data = iframe_sessions[session_param]
+        if session_data.get("tunnel_id") == tunnel_id:
+            from urllib.parse import urlencode
+            from fastapi.responses import RedirectResponse
+            raw_host = request.headers.get("host", "tunneling-service.onrender.com")
+            clean_path = f"/t/{tunnel_id}/{path}" if path else f"/t/{tunnel_id}/"
+            other_params = {k: v for k, v in request.query_params.items() if k != "__egdesk_session"}
+            qs = f"?{urlencode(other_params)}" if other_params else ""
+            clean_url = f"https://{raw_host}{clean_path}{qs}"
+
+            response = RedirectResponse(url=clean_url, status_code=302)
+            response.set_cookie(
+                key=f"egdesk_session_{tunnel_id}",
+                value=session_param,
+                httponly=True,
+                secure=True,
+                samesite="lax",
+                max_age=86400,
+                path=f"/t/{tunnel_id}",
+            )
+            print(f"🍪 Tunnel path session set for /t/{tunnel_id}")
+            return response
+
     # Check if tunnel exists locally
     if tunnel_id not in active_tunnels:
         print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
@@ -1583,16 +1675,18 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         )
 
     # ============================================
-    # Public access check — owner can mark tunnel as fully public
+    # Public access check — per-project or tunnel-wide
     # ============================================
-    is_public_tunnel = tunnel_public_flags.get(tunnel_id, False)
+    request_project = extract_project_from_path(path)
+    is_public_tunnel = is_project_public(tunnel_id, request_project)
 
     # ============================================
     # Public pass-through paths (no auth required)
     # ============================================
     PUBLIC_PATHS = {"kakao/skill", "webhook/start"}
     if is_public_tunnel:
-        print(f"🌍 Public tunnel: {tunnel_id} — skipping auth")
+        target = f"project '{request_project}'" if request_project else "tunnel"
+        print(f"🌍 Public {target}: {tunnel_id} — skipping auth")
         session_token = None
     elif path not in PUBLIC_PATHS:
         # ============================================
