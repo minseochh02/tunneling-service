@@ -2081,11 +2081,27 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                 del response_headers["Content-Length"]
 
             # Return response to original requester
-            return Response(
+            response = Response(
                 content=response_data.get("body", ""),
                 status_code=response_data.get("status_code", 200),
                 headers=response_headers
             )
+
+            # Set a cookie so subsequent requests (even without Referer) can find this tunnel.
+            # This handles dev mode where client-side navigation drops the /t/{id}/p/{name} prefix.
+            request_project = extract_project_from_path(path)
+            if request_project:
+                response.set_cookie(
+                    key="__egdesk_tunnel_ctx",
+                    value=f"{tunnel_id}:{request_project}",
+                    httponly=True,
+                    secure=True,
+                    samesite="lax",
+                    max_age=86400,
+                    path="/",
+                )
+
+            return response
 
         except Exception as e:
             if request_id in pending_requests:
@@ -2111,13 +2127,27 @@ async def custom_domain_request(path: str, request: Request):
     host = normalize_host(request.headers.get("host"))
     if host in PRIMARY_DOMAINS:
         import re
+        tunnel_id = None
+        project_name = None
+
+        # Method 1: Extract tunnel context from Referer header
         referer = request.headers.get("referer", "")
         match = re.search(r'/t/([^/]+)/p/([^/]+)', referer)
         if match:
             tunnel_id = match.group(1)
             project_name = match.group(2)
+
+        # Method 2: Fall back to cookie (survives client-side navigation that drops the prefix)
+        if not tunnel_id:
+            ctx_cookie = request.cookies.get("__egdesk_tunnel_ctx")
+            if ctx_cookie and ":" in ctx_cookie:
+                parts = ctx_cookie.split(":", 1)
+                tunnel_id = parts[0]
+                project_name = parts[1]
+
+        if tunnel_id and project_name:
             corrected_path = f"p/{project_name}/{path}"
-            print(f"🔀 Referer-based routing: /{path} → /t/{tunnel_id}/{corrected_path} (referer: {referer[:80]})")
+            print(f"🔀 Auto-routing: /{path} → /t/{tunnel_id}/{corrected_path}")
             return await tunnel_request(tunnel_id, corrected_path, request)
 
     # Log why we couldn't route this request
