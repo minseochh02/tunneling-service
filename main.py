@@ -2120,5 +2120,8 @@ async def custom_domain_request(path: str, request: Request):
             print(f"🔀 Referer-based routing: /{path} → /t/{tunnel_id}/{corrected_path} (referer: {referer[:80]})")
             return await tunnel_request(tunnel_id, corrected_path, request)
 
+    # Log why we couldn't route this request
+    referer = request.headers.get("referer", "")
+    print(f"❌ 404 catch-all: /{path} | host={host} | referer={referer[:120] if referer else '(none)'} | method={request.method}")
     return JSONResponse(status_code=404, content={"error": "Not found"})
 
