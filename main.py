@@ -2061,10 +2061,10 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
             # Send request to client through WebSocket
             print(f"📤 Sending request {request_id} to client via WebSocket")
             await websocket.send_json(request_data)
-            print(f"⏳ Waiting for response to request {request_id} (timeout: 30s)")
-
-            # Wait for response (with timeout)
-            response_data = await asyncio.wait_for(future, timeout=30.0)
+            # Wait for response — no timeout, let requests take as long as needed.
+            # The client-side browser/fetch timeout will handle hung requests.
+            print(f"⏳ Waiting for response to request {request_id} (no timeout)")
+            response_data = await future
 
             print(f"✅ Received response for {request_id}, status: {response_data.get('status_code')}")
 
@@ -2087,13 +2087,6 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                 headers=response_headers
             )
 
-        except asyncio.TimeoutError:
-            print(f"⏰ Timeout waiting for response to request {request_id}")
-            del pending_requests[request_id]
-            return JSONResponse(
-                status_code=504,
-                content={"error": "Request timeout - client didn't respond"}
-            )
         except Exception as e:
             if request_id in pending_requests:
                 del pending_requests[request_id]
