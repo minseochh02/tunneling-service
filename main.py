@@ -2108,5 +2108,24 @@ async def custom_domain_request(path: str, request: Request):
     custom_domain_response = await route_custom_domain_request(path, request)
     if custom_domain_response is not None:
         return custom_domain_response
+
+    # ============================================
+    # Referer-based tunnel routing fallback
+    # Next.js basePath doesn't apply to fetch() calls, so client-side code
+    # may call /api/... without the /t/{id}/p/{name} prefix. Use the Referer
+    # header to detect which tunnel the request belongs to and proxy it there.
+    # ============================================
+    host = normalize_host(request.headers.get("host"))
+    if host in PRIMARY_DOMAINS:
+        import re
+        referer = request.headers.get("referer", "")
+        match = re.search(r'/t/([^/]+)/p/([^/]+)', referer)
+        if match:
+            tunnel_id = match.group(1)
+            project_name = match.group(2)
+            corrected_path = f"p/{project_name}/{path}"
+            print(f"🔀 Referer-based routing: /{path} → /t/{tunnel_id}/{corrected_path} (referer: {referer[:80]})")
+            return await tunnel_request(tunnel_id, corrected_path, request)
+
     return JSONResponse(status_code=404, content={"error": "Not found"})
 
