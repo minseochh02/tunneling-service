@@ -628,7 +628,6 @@ async def register_mcp(request: Request):
                             "name": updated_data.get("name"),
                             "id": updated_data.get("id"),
                             "server_key": updated_data.get("server_key"),
-                            "owner_id": user_id,
                             "created_at": updated_data.get("created_at"),
                             "is_reregistration": True,
                             "owner_permission_added": owner_permission_added,
@@ -652,10 +651,27 @@ async def register_mcp(request: Request):
                 )
         
         # Server key doesn't exist - create new registration
-        # Note: IP-based ownership has been removed - only User ID-based ownership is used
+        # Enforce one MCP server per user (app-level check)
+        if user_id:
+            existing_user_servers = supabase.table("mcp_servers").select("id, name, server_key").eq("owner_user_id", user_id).execute()
+            if existing_user_servers.data and len(existing_user_servers.data) > 0:
+                existing_server = existing_user_servers.data[0]
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "success": False,
+                        "error": "User already has a registered server",
+                        "message": f"You already own server '{existing_server.get('name')}' (key: {existing_server.get('server_key')}). Each user can only have one MCP server.",
+                        "existing_server": {
+                            "name": existing_server.get("name"),
+                            "server_key": existing_server.get("server_key"),
+                            "id": existing_server.get("id")
+                        }
+                    }
+                )
+
         result = supabase.table("mcp_servers").insert({
-            "owner_user_id": user_id,   # User ID-based ownership (primary)
-            "owner_id": None,           # Deprecated: old field
+            "owner_user_id": user_id,
             "name": name,
             "description": description,
             "server_key": server_key,
@@ -696,7 +712,6 @@ async def register_mcp(request: Request):
                     "name": registered_data.get("name"),
                     "id": registered_data.get("id"),
                     "server_key": registered_data.get("server_key"),
-                    "owner_id": user_id,
                     "created_at": registered_data.get("created_at"),
                     "is_reregistration": False,
                     "owner_permission_added": owner_permission_added
@@ -730,6 +745,132 @@ async def register_mcp(request: Request):
                 "error": "Internal server error",
                 "message": str(e)
             }
+        )
+
+
+@app.post("/register/confirm-selection")
+async def confirm_mcp_server_selection(request: Request):
+    """Keep one MCP server for the authenticated user and delete all other owned servers."""
+    try:
+        user_id, user_email = get_user_from_auth_header(request)
+        if not user_id:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "success": False,
+                    "error": "Unauthorized",
+                    "message": "Authentication required",
+                },
+            )
+
+        body = await request.json()
+        server_key = (body.get("server_key") or "").strip().lower()
+        if not server_key:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": "Missing required fields",
+                    "message": "server_key is required",
+                },
+            )
+
+        user_servers_result = (
+            supabase.table("mcp_servers")
+            .select("id, name, server_key, created_at")
+            .eq("owner_user_id", user_id)
+            .execute()
+        )
+        user_servers = user_servers_result.data or []
+
+        keeper = next((s for s in user_servers if s.get("server_key") == server_key), None)
+        if not keeper:
+            return JSONResponse(
+                status_code=404,
+                content={
+                    "success": False,
+                    "error": "Server not found",
+                    "message": f"No owned MCP server found with key '{server_key}'",
+                },
+            )
+
+        servers_to_delete = [s for s in user_servers if s.get("id") != keeper.get("id")]
+        deleted_keys: list[str] = []
+
+        for server in servers_to_delete:
+            server_id = server.get("id")
+            server_key_to_delete = server.get("server_key")
+            if not server_id:
+                continue
+
+            try:
+                permissions = (
+                    supabase.table("mcp_server_permissions")
+                    .select("id")
+                    .eq("server_id", server_id)
+                    .execute()
+                )
+                for permission in permissions.data or []:
+                    permission_id = permission.get("id")
+                    if permission_id:
+                        supabase.table("mcp_connection_sessions").delete().eq(
+                            "permission_id", permission_id
+                        ).execute()
+
+                supabase.table("mcp_server_permissions").delete().eq(
+                    "server_id", server_id
+                ).execute()
+                supabase.table("mcp_servers").delete().eq("id", server_id).execute()
+
+                if server_key_to_delete:
+                    deleted_keys.append(server_key_to_delete)
+                    print(
+                        f"🗑️ Deleted duplicate MCP server '{server_key_to_delete}' for user {user_email or user_id}"
+                    )
+            except Exception as delete_error:
+                print(
+                    f"❌ Failed to delete MCP server '{server_key_to_delete}' ({server_id}): {delete_error}"
+                )
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "success": False,
+                        "error": "Delete failed",
+                        "message": f"Failed to delete server '{server_key_to_delete}': {delete_error}",
+                        "deleted_keys": deleted_keys,
+                    },
+                )
+
+        return JSONResponse(
+            status_code=200,
+            content={
+                "success": True,
+                "message": "MCP server selection confirmed",
+                "server_key": keeper.get("server_key"),
+                "server_name": keeper.get("name"),
+                "server_id": keeper.get("id"),
+                "deleted_count": len(deleted_keys),
+                "deleted_keys": deleted_keys,
+            },
+        )
+    except json.JSONDecodeError:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "error": "Invalid JSON",
+                "message": "Invalid JSON in request body",
+            },
+        )
+    except Exception as e:
+        print(f"❌ Confirm MCP server selection error: {e}")
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "error": "Internal server error",
+                "message": str(e),
+            },
         )
 
 @app.post("/permissions")
