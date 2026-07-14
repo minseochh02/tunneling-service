@@ -391,6 +391,7 @@ async def route_custom_domain_request(path: str, request: Request):
 
     # Refresh per-project access flags from DB for custom domain requests
     # (in-memory flags may be stale if access mode changed after tunnel connected)
+    domain_project_map: dict = {}
     try:
         server_result = supabase.table("mcp_servers").select("description").or_(
             f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
@@ -398,11 +399,17 @@ async def route_custom_domain_request(path: str, request: Request):
         if server_result.data:
             desc = parse_description_json(server_result.data[0].get("description"))
             tunnel_public_flags[tunnel_id] = load_flags_from_description(desc)
+            domain_project_map = desc.get("domain_project_map") or {}
     except Exception as e:
         print(f"⚠️ Could not load access flags for {tunnel_id}: {e}")
 
-    # Extract project name from the request path to check per-project access
-    request_project = extract_project_from_path(path)
+    # A custom domain's path (e.g. "/dashboard") never carries a "/p/{project}/" prefix
+    # the way direct tunnel URLs do, so extract_project_from_path() alone can never resolve
+    # which project this domain serves — it would always fall back to the tunnel-wide
+    # default and ignore whatever per-project public/private toggle the user actually set.
+    # domain_project_map (synced from the local domain→project mapping) is the real source
+    # of truth here; only fall back to path-extraction if this domain has no mapping saved.
+    request_project = domain_project_map.get(host) or extract_project_from_path(path)
     is_public = is_project_public(tunnel_id, request_project)
 
     # ============================================
@@ -482,7 +489,10 @@ async def route_custom_domain_request(path: str, request: Request):
 
     display_path = path or ""
     print(f"🌐 Custom domain request: {host}/{display_path} → {tunnel_id}")
-    return await tunnel_request(tunnel_id, path, request)
+    # Pass the domain-resolved project through so the inner handler's own public/private
+    # check agrees with the one just performed above, instead of re-deriving (and failing
+    # to derive) the project name from the path a second time.
+    return await _handle_tunnel_request(tunnel_id, path, request, project_override=request_project)
 
 
 @app.middleware("http")
@@ -1821,7 +1831,30 @@ async def set_tunnel_access_mode(tunnel_id: str, request: Request):
 
 @app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def tunnel_request(tunnel_id: str, path: str, request: Request):
-    """Public endpoint - forwards requests through tunnel with OAuth authentication"""
+    """Public endpoint - forwards requests through tunnel with OAuth authentication.
+
+    Thin wrapper with no extra params, so nothing here is attacker-controllable via
+    query string. Direct /t/{tunnel_id}/... links have no custom-domain context, so
+    project resolution falls back to path-extraction inside _handle_tunnel_request.
+    """
+    return await _handle_tunnel_request(tunnel_id, path, request)
+
+
+async def _handle_tunnel_request(
+    tunnel_id: str,
+    path: str,
+    request: Request,
+    project_override: str | None = None,
+):
+    """
+    Shared implementation for tunnel_request and custom-domain routing.
+
+    project_override lets route_custom_domain_request supply the project name it
+    already resolved from domain_project_map, since custom-domain paths never carry
+    a "/p/{project}/" prefix and extract_project_from_path() alone can't find it.
+    This parameter must never be reachable from the public /t/{tunnel_id}/{path}
+    route directly (see tunnel_request above) — only from trusted internal callers.
+    """
     
     # Handle CORS preflight
     if request.method == "OPTIONS":
@@ -1875,7 +1908,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
     # ============================================
     # Public access check — per-project or tunnel-wide
     # ============================================
-    request_project = extract_project_from_path(path)
+    request_project = project_override or extract_project_from_path(path)
     is_public_tunnel = is_project_public(tunnel_id, request_project)
 
     # ============================================
@@ -2256,7 +2289,7 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
 
             # Set a cookie so subsequent requests (even without Referer) can find this tunnel.
             # This handles dev mode where client-side navigation drops the /t/{id}/p/{name} prefix.
-            request_project = extract_project_from_path(path)
+            request_project = project_override or extract_project_from_path(path)
             if request_project:
                 response.set_cookie(
                     key="__egdesk_tunnel_ctx",
