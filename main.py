@@ -188,6 +188,57 @@ def clear_domain_route_cache(domain: str | None = None):
         domain_route_cache.clear()
 
 
+def is_synthetic_owner_permission_id(permission_id) -> bool:
+    """True when permission_id is the owner sentinel from session_exchange(), not a DB UUID."""
+    return isinstance(permission_id, str) and permission_id.startswith("owner-")
+
+
+def track_connection_session(
+    *,
+    server_id: str,
+    user_id: str,
+    permission_id: str,
+    session_token: str | None = None,
+) -> None:
+    """
+    Best-effort analytics/revocation bookkeeping for permission-based sessions.
+    Skips owner sentinel IDs (not valid UUIDs in mcp_connection_sessions.permission_id).
+    Never raises — connection tracking must not block request serving.
+    """
+    if is_synthetic_owner_permission_id(permission_id):
+        return
+
+    try:
+        existing_session = (
+            supabase.table("mcp_connection_sessions")
+            .select("*")
+            .eq("permission_id", permission_id)
+            .eq("status", "active")
+            .execute()
+        )
+
+        if existing_session.data and len(existing_session.data) > 0:
+            session_id = existing_session.data[0]["id"]
+            supabase.table("mcp_connection_sessions").update({
+                "last_activity_at": datetime.utcnow().isoformat(),
+                "requests_count": existing_session.data[0]["requests_count"] + 1,
+            }).eq("id", session_id).execute()
+        else:
+            token_value = session_token or secrets.token_urlsafe(32)
+            supabase.table("mcp_connection_sessions").insert({
+                "server_id": server_id,
+                "user_id": user_id,
+                "permission_id": permission_id,
+                "session_token": token_value[:16] + "...",
+                "status": "active",
+                "connected_at": datetime.utcnow().isoformat(),
+                "last_activity_at": datetime.utcnow().isoformat(),
+                "requests_count": 1,
+            }).execute()
+    except Exception as e:
+        print(f"⚠️ Failed to update connection session tracking: {e}")
+
+
 async def resolve_domain_to_tunnel(domain: str) -> str | None:
     """Resolve a configured custom domain to a tunnel/server key."""
     domain = normalize_host(domain)
@@ -1535,28 +1586,34 @@ async def authenticate_session(tunnel_id: str, request: Request, response: Respo
 
         server_id = server.data["id"]
 
-        # Check if user has permission to access this server
-        permission = supabase.table("mcp_server_permissions").select("*").eq("server_id", server_id).eq("allowed_email", user_email).single().execute()
+        # Owners always have access (same rule as session_exchange)
+        is_owner = str(server.data.get("owner_user_id")) == str(user_id)
+        if is_owner:
+            permission_id = f"owner-{user_id}"
+        else:
+            # Check if user has permission to access this server
+            permission = supabase.table("mcp_server_permissions").select("*").eq("server_id", server_id).eq("allowed_email", user_email).single().execute()
 
-        if not permission.data:
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "error": "Forbidden",
-                    "message": f"User '{user_email}' does not have permission to access this server."
-                }
-            )
+            if not permission.data:
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "Forbidden",
+                        "message": f"User '{user_email}' does not have permission to access this server."
+                    }
+                )
 
-        # Check permission status
-        perm_status = permission.data.get("status")
-        if perm_status != "active" and perm_status != "pending":
-            return JSONResponse(
-                status_code=403,
-                content={
-                    "error": "Forbidden",
-                    "message": "Your access to this server has been revoked or expired"
-                }
-            )
+            # Check permission status
+            perm_status = permission.data.get("status")
+            if perm_status != "active" and perm_status != "pending":
+                return JSONResponse(
+                    status_code=403,
+                    content={
+                        "error": "Forbidden",
+                        "message": "Your access to this server has been revoked or expired"
+                    }
+                )
+            permission_id = permission.data["id"]
 
         # Create session token
         session_token = secrets.token_urlsafe(32)
@@ -1565,7 +1622,7 @@ async def authenticate_session(tunnel_id: str, request: Request, response: Respo
             "user_email": user_email,
             "tunnel_id": tunnel_id,
             "server_id": server_id,
-            "permission_id": permission.data["id"],
+            "permission_id": permission_id,
             "created_at": datetime.utcnow().isoformat(),
             "expires_at": (datetime.utcnow() + timedelta(hours=24)).isoformat()
         }
@@ -1872,29 +1929,13 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
         server_id = session_data["server_id"]
         permission_id = session_data["permission_id"]
 
-        # Update session activity (optional)
-        # Update or create session in database for tracking
-        existing_session = supabase.table("mcp_connection_sessions").select("*").eq("permission_id", permission_id).eq("status", "active").execute()
-
-        if existing_session.data and len(existing_session.data) > 0:
-            # Update existing session
-            session_id = existing_session.data[0]["id"]
-            supabase.table("mcp_connection_sessions").update({
-                "last_activity_at": datetime.utcnow().isoformat(),
-                "requests_count": existing_session.data[0]["requests_count"] + 1
-            }).eq("id", session_id).execute()
-        else:
-            # Create new session
-            supabase.table("mcp_connection_sessions").insert({
-                "server_id": server_id,
-                "user_id": user_id,
-                "permission_id": permission_id,
-                "session_token": session_token[:16] + "...",  # Truncated for security
-                "status": "active",
-                "connected_at": datetime.utcnow().isoformat(),
-                "last_activity_at": datetime.utcnow().isoformat(),
-                "requests_count": 1
-            }).execute()
+        # Owner sessions use a synthetic permission_id (see session_exchange) — skip DB tracking.
+        track_connection_session(
+            server_id=server_id,
+            user_id=user_id,
+            permission_id=permission_id,
+            session_token=session_token,
+        )
 
         # Skip to request forwarding (jump past OAuth/API key checks)
         pass  # Continue to request forwarding below
@@ -1991,44 +2032,34 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
 
             server_id = server.data["id"]
 
-            # Check if user has permission to access this server
-            permission = supabase.table("mcp_server_permissions").select("*").eq("server_id", server_id).eq("allowed_email", user_email).single().execute()
+            # Owners always have access without an explicit permission row
+            is_owner = str(server.data.get("owner_user_id")) == str(user_id)
+            if is_owner:
+                print(f"✅ Owner OAuth access granted for {user_email} to access {tunnel_id}")
+            else:
+                # Check if user has permission to access this server
+                permission = supabase.table("mcp_server_permissions").select("*").eq("server_id", server_id).eq("allowed_email", user_email).single().execute()
 
-            if not permission.data:
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "error": "Forbidden",
-                        "message": f"User '{user_email}' does not have permission to access this server. Contact the server owner to request access."
-                    }
-                )
+                if not permission.data:
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "error": "Forbidden",
+                            "message": f"User '{user_email}' does not have permission to access this server. Contact the server owner to request access."
+                        }
+                    )
 
-            # Check permission status
-            perm_status = permission.data.get("status")
-            if perm_status == "revoked":
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "error": "Forbidden",
-                        "message": "Your access to this server has been revoked"
-                    }
-                )
-            elif perm_status == "expired":
-                return JSONResponse(
-                    status_code=403,
-                    content={
-                        "error": "Forbidden",
-                        "message": "Your access to this server has expired"
-                    }
-                )
-
-            # Check expiration date
-            expires_at = permission.data.get("expires_at")
-            if expires_at:
-                expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
-                if datetime.now(expiry.tzinfo) > expiry:
-                    # Auto-expire the permission
-                    supabase.table("mcp_server_permissions").update({"status": "expired"}).eq("id", permission.data["id"]).execute()
+                # Check permission status
+                perm_status = permission.data.get("status")
+                if perm_status == "revoked":
+                    return JSONResponse(
+                        status_code=403,
+                        content={
+                            "error": "Forbidden",
+                            "message": "Your access to this server has been revoked"
+                        }
+                    )
+                elif perm_status == "expired":
                     return JSONResponse(
                         status_code=403,
                         content={
@@ -2037,40 +2068,35 @@ async def tunnel_request(tunnel_id: str, path: str, request: Request):
                         }
                     )
 
-            # If permission is pending, activate it on first use
-            if perm_status == "pending":
-                supabase.table("mcp_server_permissions").update({
-                    "status": "active",
-                    "activated_at": datetime.utcnow().isoformat(),
-                    "user_id": user_id
-                }).eq("id", permission.data["id"]).execute()
-                print(f"✅ Activated permission for {user_email}")
+                # Check expiration date
+                expires_at = permission.data.get("expires_at")
+                if expires_at:
+                    expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+                    if datetime.now(expiry.tzinfo) > expiry:
+                        # Auto-expire the permission
+                        supabase.table("mcp_server_permissions").update({"status": "expired"}).eq("id", permission.data["id"]).execute()
+                        return JSONResponse(
+                            status_code=403,
+                            content={
+                                "error": "Forbidden",
+                                "message": "Your access to this server has expired"
+                            }
+                        )
 
-            # Update or create session
-            # Try to find existing active session
-            existing_session = supabase.table("mcp_connection_sessions").select("*").eq("permission_id", permission.data["id"]).eq("status", "active").execute()
+                # If permission is pending, activate it on first use
+                if perm_status == "pending":
+                    supabase.table("mcp_server_permissions").update({
+                        "status": "active",
+                        "activated_at": datetime.utcnow().isoformat(),
+                        "user_id": user_id
+                    }).eq("id", permission.data["id"]).execute()
+                    print(f"✅ Activated permission for {user_email}")
 
-            if existing_session.data and len(existing_session.data) > 0:
-                # Update existing session
-                session_id = existing_session.data[0]["id"]
-                supabase.table("mcp_connection_sessions").update({
-                    "last_activity_at": datetime.utcnow().isoformat(),
-                    "requests_count": existing_session.data[0]["requests_count"] + 1
-                }).eq("id", session_id).execute()
-            else:
-                # Create new session
-                import secrets
-                session_token = secrets.token_urlsafe(32)
-                supabase.table("mcp_connection_sessions").insert({
-                    "server_id": server_id,
-                    "user_id": user_id,
-                    "permission_id": permission.data["id"],
-                    "session_token": session_token,
-                    "status": "active",
-                    "connected_at": datetime.utcnow().isoformat(),
-                    "last_activity_at": datetime.utcnow().isoformat(),
-                    "requests_count": 1
-                }).execute()
+                track_connection_session(
+                    server_id=server_id,
+                    user_id=user_id,
+                    permission_id=permission.data["id"],
+                )
 
             print(f"✅ Authorization granted for {user_email} to access {tunnel_id}")
 
