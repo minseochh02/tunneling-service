@@ -1829,6 +1829,72 @@ async def set_tunnel_access_mode(tunnel_id: str, request: Request):
     })
 
 
+@app.put("/t/{tunnel_id}/domain-mapping")
+async def set_tunnel_domain_mapping(tunnel_id: str, request: Request):
+    """
+    Sync domain -> project mappings for a tunnel.
+    Used by the Electron app to ensure the remote router knows which project
+    a custom domain belongs to for access control.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+
+    domain = body.get("domain")
+    project_name = body.get("project") # Can be None to clear mapping
+
+    if not domain:
+        return JSONResponse(status_code=400, content={"error": "domain is required"})
+
+    # Verify ownership
+    server_check = supabase.table("mcp_servers").select("*").or_(
+        f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
+    ).execute()
+
+    if not server_check.data:
+        return JSONResponse(status_code=404, content={"error": "Tunnel not found"})
+
+    server_data = server_check.data[0]
+    is_owner, err = verify_ownership(request, server_data)
+    if not is_owner:
+        return JSONResponse(status_code=403, content={"error": err or "Forbidden"})
+
+    try:
+        desc_json = parse_description_json(server_data.get("description"))
+        domain_project_map = desc_json.get("domain_project_map") or {}
+        
+        # We update both the bare domain and the www variant
+        variants = [domain.lower()]
+        if domain.startswith("www."):
+            variants.append(domain[4:].lower())
+        else:
+            variants.append(f"www.{domain}".lower())
+
+        for v in variants:
+            if project_name:
+                domain_project_map[v] = project_name
+            else:
+                domain_project_map.pop(v, None)
+
+        desc_json["domain_project_map"] = domain_project_map
+        desc_json["domain_project_map_updated_at"] = datetime.utcnow().isoformat()
+
+        supabase.table("mcp_servers").update({
+            "description": json.dumps(desc_json)
+        }).eq("id", server_data["id"]).execute()
+        
+        # Clear cache so next request sees the new mapping
+        for v in variants:
+            clear_domain_route_cache(v)
+
+        print(f"🌐 Updated domain mapping for {tunnel_id}: {domain} -> {project_name}")
+        return {"success": True, "domain": domain, "project": project_name}
+    except Exception as e:
+        print(f"❌ Failed to update domain mapping in Supabase: {e}")
+        return JSONResponse(status_code=500, content={"error": "Failed to persist domain mapping"})
+
+
 @app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def tunnel_request(tunnel_id: str, path: str, request: Request):
     """Public endpoint - forwards requests through tunnel with OAuth authentication.
