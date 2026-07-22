@@ -10,6 +10,7 @@ import secrets
 import time
 import httpx
 from datetime import datetime, timedelta
+from urllib.parse import quote
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from sheet_sync_router import sheet_sync_router
@@ -321,6 +322,39 @@ async def add_custom_domain_to_render(domain: str) -> dict:
         return {"domain": domain, "success": False, "error": str(e)}
 
 
+async def remove_custom_domain_from_render(domain: str) -> dict:
+    """Remove a custom domain from the Render service (SSL + routing)."""
+    if not RENDER_API_KEY or not RENDER_SERVICE_ID:
+        return {"domain": domain, "success": False, "skipped": True, "error": "RENDER_API_KEY or RENDER_SERVICE_ID is not configured"}
+
+    encoded_domain = quote(domain, safe="")
+    url = f"https://api.render.com/v1/services/{RENDER_SERVICE_ID}/custom-domains/{encoded_domain}"
+    headers = {
+        "Authorization": f"Bearer {RENDER_API_KEY}",
+        "Accept": "application/json",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.delete(url, headers=headers)
+
+        body = None
+        try:
+            body = response.json()
+        except Exception:
+            body = response.text
+
+        # 204 = deleted; 404 = already gone (idempotent success)
+        if response.status_code in (200, 202, 204):
+            return {"domain": domain, "success": True, "status_code": response.status_code, "response": body}
+        if response.status_code == 404:
+            return {"domain": domain, "success": True, "already_removed": True, "status_code": response.status_code, "response": body}
+
+        return {"domain": domain, "success": False, "status_code": response.status_code, "error": body}
+    except Exception as e:
+        return {"domain": domain, "success": False, "error": str(e)}
+
+
 def merge_custom_domains_description(raw_description, domains: list[str]) -> str:
     desc = parse_description_json(raw_description)
     existing = desc.get("custom_domains") or []
@@ -330,6 +364,32 @@ def merge_custom_domains_description(raw_description, domains: list[str]) -> str
         if host and host not in merged:
             merged.append(host)
     desc["custom_domains"] = merged
+    desc["custom_domain_updated_at"] = datetime.utcnow().isoformat()
+    return json.dumps(desc)
+
+
+def remove_custom_domains_description(raw_description, domains: list[str]) -> str:
+    """Remove domains from custom_domains and domain_project_map in mcp_servers.description."""
+    desc = parse_description_json(raw_description)
+    remove_set = {normalize_host(str(d)) for d in domains if d}
+    remove_set.discard("")
+
+    existing = desc.get("custom_domains") or []
+    desc["custom_domains"] = [
+        host for host in (normalize_host(str(d)) for d in existing) if host and host not in remove_set
+    ]
+
+    singular = normalize_host(str(desc.get("custom_domain") or ""))
+    if singular and singular in remove_set:
+        desc.pop("custom_domain", None)
+
+    domain_project_map = desc.get("domain_project_map") or {}
+    if isinstance(domain_project_map, dict):
+        for host in remove_set:
+            domain_project_map.pop(host, None)
+        desc["domain_project_map"] = domain_project_map
+        desc["domain_project_map_updated_at"] = datetime.utcnow().isoformat()
+
     desc["custom_domain_updated_at"] = datetime.utcnow().isoformat()
     return json.dumps(desc)
 
@@ -570,6 +630,57 @@ async def register_custom_domains(request: Request):
         }
     except Exception as e:
         print(f"❌ Failed to register custom domains: {e}")
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+@app.post("/custom-domains/deregister")
+async def deregister_custom_domains(request: Request):
+    """Remove custom domains from a tunnel and delete them from Render."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
+
+    server_key = str(body.get("server_key") or "").strip()
+    domains = normalize_custom_domains(body.get("domains") or [])
+
+    if not server_key:
+        return JSONResponse(status_code=400, content={"error": "server_key is required"})
+    if not domains:
+        return JSONResponse(status_code=400, content={"error": "At least one valid domain is required"})
+
+    try:
+        server_result = supabase.table("mcp_servers").select("*").or_(
+            f"server_key.eq.{server_key},name.eq.{server_key}"
+        ).execute()
+        server_data = (server_result.data or [None])[0]
+        if not server_data:
+            return JSONResponse(status_code=404, content={"error": f"Server '{server_key}' not found"})
+
+        is_owner, ownership_error = verify_ownership(request, server_data)
+        if not is_owner:
+            return JSONResponse(status_code=403, content={"error": ownership_error or "Forbidden"})
+
+        updated_description = remove_custom_domains_description(server_data.get("description"), domains)
+        supabase.table("mcp_servers").update({"description": updated_description}).eq("id", server_data["id"]).execute()
+
+        for domain in domains:
+            clear_domain_route_cache(domain)
+
+        render_results = []
+        for domain in domains:
+            result = await remove_custom_domain_from_render(domain)
+            render_results.append(result)
+
+        return {
+            "success": True,
+            "server_key": server_data.get("server_key"),
+            "domains": domains,
+            "render_removed": all(item.get("success") for item in render_results),
+            "render_results": render_results,
+        }
+    except Exception as e:
+        print(f"❌ Failed to deregister custom domains: {e}")
         return JSONResponse(status_code=500, content={"error": str(e)})
 
 
