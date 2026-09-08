@@ -2092,11 +2092,17 @@ async def _handle_tunnel_request(
     # Public pass-through paths (no auth required)
     # ============================================
     PUBLIC_PATHS = {"kakao/skill", "webhook/start"}
+    # Google redirects the browser here after visitor login. This must stay
+    # unauthenticated — otherwise the gateway sends users to egdesk.cloud/auth/tunnel-login.
+    is_visitor_oauth_callback = (
+        path == "visitor-auth/callback" or path.startswith("visitor-auth/callback/")
+    )
+    skip_tunnel_auth = path in PUBLIC_PATHS or is_visitor_oauth_callback
     if is_public_tunnel:
         target = f"project '{request_project}'" if request_project else "tunnel"
         print(f"🌍 Public {target}: {tunnel_id} — skipping auth")
         session_token = None
-    elif path not in PUBLIC_PATHS:
+    elif not skip_tunnel_auth:
         # ============================================
         # Session Cookie Authentication (for iframes)
         # ============================================
@@ -2111,7 +2117,7 @@ async def _handle_tunnel_request(
         print(f"🔓 Public path bypass: /{path} — skipping tunnel auth")
         session_token = None
 
-    if not is_public_tunnel and path not in PUBLIC_PATHS and session_token and session_token in iframe_sessions:
+    if not is_public_tunnel and not skip_tunnel_auth and session_token and session_token in iframe_sessions:
         session_data = iframe_sessions[session_token]
 
         # Check if session expired
@@ -2153,7 +2159,7 @@ async def _handle_tunnel_request(
     # ============================================
     # API Key Authentication (Apps Script / service accounts)
     # ============================================
-    elif not is_public_tunnel and path not in PUBLIC_PATHS and (api_key_header := request.headers.get("X-Api-Key")):
+    elif not is_public_tunnel and not skip_tunnel_auth and (api_key_header := request.headers.get("X-Api-Key")):
         # Query Supabase for the key stored in the description JSON
         try:
             # Find server by server_key OR name (slug) to be resilient
@@ -2175,7 +2181,7 @@ async def _handle_tunnel_request(
         except Exception as e:
             print(f"⚠️ API key check failed: {e}")
             return JSONResponse(status_code=500, content={"error": "Authentication check failed"})
-    elif not is_public_tunnel and path not in PUBLIC_PATHS:
+    elif not is_public_tunnel and not skip_tunnel_auth:
         # ============================================
         # OAuth Authentication & Authorization
         # ============================================
