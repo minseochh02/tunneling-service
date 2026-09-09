@@ -2083,7 +2083,7 @@ async def _handle_tunnel_request(
 
     # ============================================
     # Bizinfo (기업마당) — handled on this gateway, not forwarded to EGDesk.
-    # 사용신청 시스템URL is this host; crtfcKey lives in BIZINFO_CRTFC_KEY.
+    # 사용신청 시스템URL is this host; crtfcKey lives in TUNNELING_API_KEY.
     # EGDesk apps still send X-Api-Key for the tunnel.
     # ============================================
     if path == "bizinfo/tools" or path.startswith("bizinfo/tools/"):

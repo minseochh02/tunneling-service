@@ -4,7 +4,7 @@ Bizinfo (기업마당 지원사업) — executed on the tunnel gateway.
 사용신청 시스템URL is https://tunneling-service.onrender.com/
 so 기업마당 must see requests from this host, not from each user's desktop.
 
-Env: BIZINFO_CRTFC_KEY
+Env: TUNNELING_API_KEY (기업마당 crtfcKey on tunneling-service)
 """
 
 from __future__ import annotations
@@ -80,7 +80,7 @@ bizinfo_router = APIRouter(prefix="/bizinfo", tags=["Bizinfo"])
 
 
 def _crtfc_key() -> str:
-    return (os.getenv("BIZINFO_CRTFC_KEY") or "").strip()
+    return (os.getenv("TUNNELING_API_KEY") or os.getenv("BIZINFO_CRTFC_KEY") or "").strip()
 
 
 def mcp_ok(data: Any) -> JSONResponse:
@@ -167,7 +167,7 @@ async def bizinfo_fetch(params: dict[str, str]) -> Any:
     key = _crtfc_key()
     if not key:
         raise RuntimeError(
-            "BIZINFO_CRTFC_KEY is not set on tunneling-service. "
+            "TUNNELING_API_KEY is not set on tunneling-service. "
             "Apply at https://www.bizinfo.go.kr/apiDetail.do?id=bizinfoApi "
             "with 시스템URL https://tunneling-service.onrender.com/"
         )
@@ -189,9 +189,35 @@ async def bizinfo_fetch(params: dict[str, str]) -> Any:
         raise RuntimeError(f"응답 파싱 실패: {text[:200]}") from exc
 
 
+def _extract_raw_items(data: Any) -> list:
+    """Handle jsonArray as object {item:[...]} or as a direct item list."""
+    if data is None:
+        return []
+    if isinstance(data, list):
+        if not data:
+            return []
+        first = data[0]
+        if isinstance(first, dict) and "item" in first:
+            out: list = []
+            for block in data:
+                if isinstance(block, dict):
+                    out.extend(as_list(block.get("item")))
+            return out
+        if isinstance(first, dict) and (
+            "pblancId" in first or "seq" in first or "pblancNm" in first
+        ):
+            return [x for x in data if isinstance(x, dict)]
+        return []
+    if isinstance(data, dict):
+        if "item" in data:
+            return as_list(data.get("item"))
+        if "jsonArray" in data:
+            return _extract_raw_items(data.get("jsonArray"))
+    return []
+
+
 def parse_items(data: Any) -> tuple[int, list[dict]]:
-    root = (data or {}).get("jsonArray") or data or {}
-    raw_items = as_list(root.get("item"))
+    raw_items = _extract_raw_items(data)
     items = [normalize_announcement(item or {}) for item in raw_items]
     tot = 0
     if raw_items:
@@ -293,7 +319,7 @@ async def handle_bizinfo_http(method: str, path: str, body: dict | None) -> JSON
 @bizinfo_router.get("/tools")
 async def list_tools():
     if not _crtfc_key():
-        return mcp_err("BIZINFO_CRTFC_KEY is not set on tunneling-service", 503)
+        return mcp_err("TUNNELING_API_KEY is not set on tunneling-service", 503)
     return JSONResponse(BIZINFO_TOOLS)
 
 
