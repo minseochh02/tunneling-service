@@ -14,6 +14,7 @@ from urllib.parse import quote
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from sheet_sync_router import sheet_sync_router
+from bizinfo_router import bizinfo_router, handle_bizinfo_http
 
 # Load environment variables
 load_dotenv()
@@ -34,6 +35,7 @@ app = FastAPI()
 # After your app is created, include the router
 
 app.include_router(sheet_sync_router)
+app.include_router(bizinfo_router)
 
 # Configure CORS
 app.add_middleware(
@@ -578,7 +580,12 @@ async def root(request: Request):
         "service": "Tunnel Service",
         "active_tunnels": len(active_tunnels),
         "tunnel_ids": list(active_tunnels.keys()),
-        "instructions": "Connect client via WebSocket to /tunnel/connect"
+        "instructions": "Connect client via WebSocket to /tunnel/connect",
+        "bizinfo": {
+            "tools": "/bizinfo/tools",
+            "call": "/bizinfo/tools/call",
+            "tunnel": "/t/{tunnelId}/bizinfo/tools/call",
+        },
     }
 
 @app.post("/custom-domains/register")
@@ -2074,6 +2081,51 @@ async def _handle_tunnel_request(
             print(f"🍪 Tunnel path session set for /t/{tunnel_id}")
             return response
 
+    # ============================================
+    # Bizinfo (기업마당) — handled on this gateway, not forwarded to EGDesk.
+    # 사용신청 시스템URL is this host; crtfcKey lives in BIZINFO_CRTFC_KEY.
+    # EGDesk apps still send X-Api-Key for the tunnel.
+    # ============================================
+    if path == "bizinfo/tools" or path.startswith("bizinfo/tools/"):
+        api_key_header = request.headers.get("X-Api-Key")
+        if not api_key_header:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "message": "Missing X-Api-Key. EGDesk tunnel API key is required for Bizinfo.",
+                },
+            )
+        try:
+            server_check = supabase.table("mcp_servers").select("description").or_(
+                f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
+            ).execute()
+            stored_key = None
+            if server_check.data:
+                try:
+                    desc_json = json.loads(server_check.data[0].get("description") or "{}")
+                    stored_key = desc_json.get("api_key")
+                except Exception:
+                    stored_key = None
+            if not stored_key or stored_key != api_key_header:
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "Unauthorized", "message": "Invalid API key"},
+                )
+        except Exception as e:
+            print(f"⚠️ Bizinfo API key check failed: {e}")
+            return JSONResponse(status_code=500, content={"error": "Authentication check failed"})
+
+        body = None
+        if request.method == "POST":
+            try:
+                raw = await request.body()
+                body = json.loads(raw.decode() or "{}") if raw else {}
+            except Exception:
+                body = {}
+        print(f"🏢 Bizinfo gateway: {request.method} /{path} for tunnel {tunnel_id}")
+        return await handle_bizinfo_http(request.method, path[len("bizinfo/"):], body)
+
     # Check if tunnel exists locally
     if tunnel_id not in active_tunnels:
         print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
@@ -2091,7 +2143,7 @@ async def _handle_tunnel_request(
     # ============================================
     # Public pass-through paths (no auth required)
     # ============================================
-    PUBLIC_PATHS = {"kakao/skill", "webhook/start"}
+    PUBLIC_PATHS = {"kakao/skill", "webhook/start", "bizinfo/tools", "bizinfo/tools/call"}
     # Google redirects the browser here after visitor login. This must stay
     # unauthenticated — otherwise the gateway sends users to egdesk.cloud/auth/tunnel-login.
     is_visitor_oauth_callback = (
