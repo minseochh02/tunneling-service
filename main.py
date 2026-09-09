@@ -15,6 +15,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from sheet_sync_router import sheet_sync_router
 from bizinfo_router import bizinfo_router, handle_bizinfo_http
+from bizverify_router import bizverify_router, handle_bizverify_http
 
 # Load environment variables
 load_dotenv()
@@ -36,6 +37,7 @@ app = FastAPI()
 
 app.include_router(sheet_sync_router)
 app.include_router(bizinfo_router)
+app.include_router(bizverify_router)
 
 # Configure CORS
 app.add_middleware(
@@ -2083,8 +2085,8 @@ async def _handle_tunnel_request(
 
     # ============================================
     # Bizinfo (기업마당) — handled on this gateway, not forwarded to EGDesk.
-    # 사용신청 시스템URL is this host; crtfcKey lives in TUNNELING_API_KEY.
-    # EGDesk apps still send X-Api-Key for the tunnel.
+    # 사용신청 시스템URL is this host; crtfcKey lives in BIZINFO_CRTFC_KEY.
+    # EGDesk apps still send X-Api-Key for the tunnel. Keys never on desktop.
     # ============================================
     if path == "bizinfo/tools" or path.startswith("bizinfo/tools/"):
         api_key_header = request.headers.get("X-Api-Key")
@@ -2126,6 +2128,50 @@ async def _handle_tunnel_request(
         print(f"🏢 Bizinfo gateway: {request.method} /{path} for tunnel {tunnel_id}")
         return await handle_bizinfo_http(request.method, path[len("bizinfo/"):], body)
 
+    # ============================================
+    # Bizverify (국세청) — handled on this gateway, not forwarded to EGDesk.
+    # DATA_GO_KR_API_KEY lives on Render only.
+    # ============================================
+    if path == "bizverify/tools" or path.startswith("bizverify/tools/"):
+        api_key_header = request.headers.get("X-Api-Key")
+        if not api_key_header:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "message": "Missing X-Api-Key. EGDesk tunnel API key is required for Bizverify.",
+                },
+            )
+        try:
+            server_check = supabase.table("mcp_servers").select("description").or_(
+                f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
+            ).execute()
+            stored_key = None
+            if server_check.data:
+                try:
+                    desc_json = json.loads(server_check.data[0].get("description") or "{}")
+                    stored_key = desc_json.get("api_key")
+                except Exception:
+                    stored_key = None
+            if not stored_key or stored_key != api_key_header:
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "Unauthorized", "message": "Invalid API key"},
+                )
+        except Exception as e:
+            print(f"⚠️ Bizverify API key check failed: {e}")
+            return JSONResponse(status_code=500, content={"error": "Authentication check failed"})
+
+        body = None
+        if request.method == "POST":
+            try:
+                raw = await request.body()
+                body = json.loads(raw.decode() or "{}") if raw else {}
+            except Exception:
+                body = {}
+        print(f"🪪 Bizverify gateway: {request.method} /{path} for tunnel {tunnel_id}")
+        return await handle_bizverify_http(request.method, path[len("bizverify/"):], body)
+
     # Check if tunnel exists locally
     if tunnel_id not in active_tunnels:
         print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
@@ -2143,7 +2189,14 @@ async def _handle_tunnel_request(
     # ============================================
     # Public pass-through paths (no auth required)
     # ============================================
-    PUBLIC_PATHS = {"kakao/skill", "webhook/start", "bizinfo/tools", "bizinfo/tools/call"}
+    PUBLIC_PATHS = {
+        "kakao/skill",
+        "webhook/start",
+        "bizinfo/tools",
+        "bizinfo/tools/call",
+        "bizverify/tools",
+        "bizverify/tools/call",
+    }
     # Google redirects the browser here after visitor login. This must stay
     # unauthenticated — otherwise the gateway sends users to egdesk.cloud/auth/tunnel-login.
     is_visitor_oauth_callback = (

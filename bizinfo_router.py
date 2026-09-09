@@ -4,7 +4,7 @@ Bizinfo (기업마당 지원사업) — executed on the tunnel gateway.
 사용신청 시스템URL is https://tunneling-service.onrender.com/
 so 기업마당 must see requests from this host, not from each user's desktop.
 
-Env: TUNNELING_API_KEY (기업마당 crtfcKey on tunneling-service)
+Env: BIZINFO_CRTFC_KEY (기업마당 crtfcKey — tunneling-service only, never client)
 """
 
 from __future__ import annotations
@@ -34,10 +34,23 @@ CATEGORY_CODES = {
     "other": "09",
 }
 
+BIZINFO_PURPOSE = (
+    "This lists Korean government 지원사업·공고·표창 from 기업마당 (grants and program notices). "
+    "Use it for open SME funding and ministry announcements. "
+    "Do NOT use it to look up or verify a company (상호, 법인, 사업자등록). "
+    "Example: “태림산업(주) 확인해줘” is not a Bizinfo query — Korean 상호 are not unique. "
+    "success with items:[] means no matching 공고, not that the company does not exist. "
+    "To verify a business you need 사업자등록번호 (국세청/bizverify) or a domain (company-research)."
+)
+
 BIZINFO_TOOLS = [
     {
         "name": "bizinfo_search",
-        "description": "기업마당에서 정부 지원사업·공고를 조회합니다. query는 제목·개요 클라이언트 필터입니다.",
+        "description": (
+            BIZINFO_PURPOSE
+            + " 기업마당에서 지원사업 공고를 조회합니다. "
+            "query는 공고 제목·개요·소관기관 클라이언트 필터입니다. 회사명을 query에 넣지 마세요."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -52,7 +65,10 @@ BIZINFO_TOOLS = [
     },
     {
         "name": "bizinfo_open",
-        "description": "현재 신청 가능한 지원사업만 반환하고 마감일 오름차순 정렬합니다.",
+        "description": (
+            BIZINFO_PURPOSE
+            + " 현재 신청 가능한 지원사업만 반환하고 마감일 오름차순 정렬합니다. 지원사업 조회 시 이 도구를 먼저 쓰세요."
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -67,7 +83,7 @@ BIZINFO_TOOLS = [
     },
     {
         "name": "bizinfo_get",
-        "description": "공고 ID(pblancId)로 한 건을 찾습니다.",
+        "description": "기업마당 공고 ID(pblancId)로 지원사업 한 건을 찾습니다. 회사/사업자 조회가 아닙니다.",
         "inputSchema": {
             "type": "object",
             "properties": {"id": {"type": "string"}},
@@ -80,7 +96,7 @@ bizinfo_router = APIRouter(prefix="/bizinfo", tags=["Bizinfo"])
 
 
 def _crtfc_key() -> str:
-    return (os.getenv("TUNNELING_API_KEY") or os.getenv("BIZINFO_CRTFC_KEY") or "").strip()
+    return (os.getenv("BIZINFO_CRTFC_KEY") or "").strip()
 
 
 def mcp_ok(data: Any) -> JSONResponse:
@@ -167,7 +183,7 @@ async def bizinfo_fetch(params: dict[str, str]) -> Any:
     key = _crtfc_key()
     if not key:
         raise RuntimeError(
-            "TUNNELING_API_KEY is not set on tunneling-service. "
+            "BIZINFO_CRTFC_KEY is not set on tunneling-service. "
             "Apply at https://www.bizinfo.go.kr/apiDetail.do?id=bizinfoApi "
             "with 시스템URL https://tunneling-service.onrender.com/"
         )
@@ -319,7 +335,7 @@ async def handle_bizinfo_http(method: str, path: str, body: dict | None) -> JSON
 @bizinfo_router.get("/tools")
 async def list_tools():
     if not _crtfc_key():
-        return mcp_err("TUNNELING_API_KEY is not set on tunneling-service", 503)
+        return mcp_err("BIZINFO_CRTFC_KEY is not set on tunneling-service", 503)
     return JSONResponse(BIZINFO_TOOLS)
 
 
