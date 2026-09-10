@@ -17,6 +17,7 @@ from sheet_sync_router import sheet_sync_router
 from bizinfo_router import bizinfo_router, handle_bizinfo_http
 from bizverify_router import bizverify_router, handle_bizverify_http
 from nps_router import nps_router, handle_nps_http
+from koneps_router import koneps_router, handle_koneps_http
 
 # Load environment variables
 load_dotenv()
@@ -40,6 +41,7 @@ app.include_router(sheet_sync_router)
 app.include_router(bizinfo_router)
 app.include_router(bizverify_router)
 app.include_router(nps_router)
+app.include_router(koneps_router)
 
 # Configure CORS
 app.add_middleware(
@@ -594,6 +596,11 @@ async def root(request: Request):
             "tools": "/nps/tools",
             "call": "/nps/tools/call",
             "tunnel": "/t/{tunnelId}/nps/tools/call",
+        },
+        "koneps": {
+            "tools": "/koneps/tools",
+            "call": "/koneps/tools/call",
+            "tunnel": "/t/{tunnelId}/koneps/tools/call",
         },
     }
 
@@ -2223,6 +2230,50 @@ async def _handle_tunnel_request(
         print(f"📈 NPS gateway: {request.method} /{path} for tunnel {tunnel_id}")
         return await handle_nps_http(request.method, path[len("nps/"):], body)
 
+    # ============================================
+    # KONEPS (나라장터 계약정보) — handled on this gateway, not forwarded to EGDesk.
+    # DATA_GO_KR_API_KEY lives on Render only. Dataset 15129427.
+    # ============================================
+    if path == "koneps/tools" or path.startswith("koneps/tools/"):
+        api_key_header = request.headers.get("X-Api-Key")
+        if not api_key_header:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "message": "Missing X-Api-Key. EGDesk tunnel API key is required for KONEPS.",
+                },
+            )
+        try:
+            server_check = supabase.table("mcp_servers").select("description").or_(
+                f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
+            ).execute()
+            stored_key = None
+            if server_check.data:
+                try:
+                    desc_json = json.loads(server_check.data[0].get("description") or "{}")
+                    stored_key = desc_json.get("api_key")
+                except Exception:
+                    stored_key = None
+            if not stored_key or stored_key != api_key_header:
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "Unauthorized", "message": "Invalid API key"},
+                )
+        except Exception as e:
+            print(f"⚠️ KONEPS API key check failed: {e}")
+            return JSONResponse(status_code=500, content={"error": "Authentication check failed"})
+
+        body = None
+        if request.method == "POST":
+            try:
+                raw = await request.body()
+                body = json.loads(raw.decode() or "{}") if raw else {}
+            except Exception:
+                body = {}
+        print(f"🏛️ KONEPS gateway: {request.method} /{path} for tunnel {tunnel_id}")
+        return await handle_koneps_http(request.method, path[len("koneps/"):], body)
+
     # Check if tunnel exists locally
     if tunnel_id not in active_tunnels:
         print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
@@ -2249,6 +2300,8 @@ async def _handle_tunnel_request(
         "bizverify/tools/call",
         "nps/tools",
         "nps/tools/call",
+        "koneps/tools",
+        "koneps/tools/call",
     }
     # Google redirects the browser here after visitor login. This must stay
     # unauthenticated — otherwise the gateway sends users to egdesk.cloud/auth/tunnel-login.
