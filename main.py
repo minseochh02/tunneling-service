@@ -1,3 +1,4 @@
+from custom_domain_path import inject_custom_domain_project_path, strip_tunnel_path_prefix
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, Cookie
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -479,7 +480,11 @@ async def route_custom_domain_request(path: str, request: Request):
     # default and ignore whatever per-project public/private toggle the user actually set.
     # domain_project_map (synced from the local domain→project mapping) is the real source
     # of truth here; only fall back to path-extraction if this domain has no mapping saved.
-    request_project = domain_project_map.get(host) or extract_project_from_path(path)
+    mapped_project = domain_project_map.get(host)
+    request_project = mapped_project or extract_project_from_path(path)
+    forward_path = path
+    if mapped_project:
+        forward_path = inject_custom_domain_project_path(path, mapped_project, tunnel_id)
     is_public = is_project_public(tunnel_id, request_project)
 
     # ============================================
@@ -557,12 +562,18 @@ async def route_custom_domain_request(path: str, request: Request):
                     from fastapi.responses import RedirectResponse
                     return RedirectResponse(url=login_url, status_code=302)
 
-    display_path = path or ""
-    print(f"🌐 Custom domain request: {host}/{display_path} → {tunnel_id}")
+    display_path = forward_path or path or ""
+    if mapped_project and forward_path != path:
+        print(
+            f"🌐 Custom domain request: {host}/{path or ''} → "
+            f"{tunnel_id} (injected p/{mapped_project}/ → {display_path})"
+        )
+    else:
+        print(f"🌐 Custom domain request: {host}/{display_path} → {tunnel_id}")
     # Pass the domain-resolved project through so the inner handler's own public/private
     # check agrees with the one just performed above, instead of re-deriving (and failing
     # to derive) the project name from the path a second time.
-    return await _handle_tunnel_request(tunnel_id, path, request, project_override=request_project)
+    return await _handle_tunnel_request(tunnel_id, forward_path, request, project_override=request_project)
 
 
 @app.middleware("http")
