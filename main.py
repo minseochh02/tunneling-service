@@ -1,5 +1,6 @@
 from custom_domain_path import inject_custom_domain_project_path, strip_tunnel_path_prefix
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, Cookie
+from starlette.websockets import WebSocketState
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
@@ -103,6 +104,25 @@ def _ensure_active_tunnel(tunnel_id: str, websocket: WebSocket) -> None:
         return
     active_tunnels[tunnel_id] = websocket
     print(f"🔧 Re-bound live tunnel '{tunnel_id}' into active_tunnels")
+
+
+async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
+    """Send JSON; False if the client already closed. Never raise disconnect."""
+    try:
+        if websocket.client_state != WebSocketState.CONNECTED:
+            return False
+        await websocket.send_json(payload)
+        return True
+    except (WebSocketDisconnect, RuntimeError):
+        return False
+
+
+async def _ws_close(websocket: WebSocket) -> None:
+    try:
+        if websocket.client_state == WebSocketState.CONNECTED:
+            await websocket.close()
+    except Exception:
+        pass
 
 # Session storage for authenticated iframe access
 # {session_token: {user_id, user_email, tunnel_id, created_at, expires_at}}
@@ -1530,11 +1550,11 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
     
     # Use server name as tunnel identifier
     if not name:
-        await websocket.send_json({
+        await _ws_send_json(websocket, {
             "type": "error",
             "message": "Server name is required as query parameter"
         })
-        await websocket.close()
+        await _ws_close(websocket)
         return
     
     # Check if server is registered in mcp_servers table (check by server_key or name)
@@ -1542,11 +1562,11 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
     existing = supabase.table("mcp_servers").select("id, name, server_key, status, owner_user_id, description").or_(f"server_key.eq.{name},name.eq.{name}").execute()
     
     if not existing.data or len(existing.data) == 0:
-        await websocket.send_json({
+        await _ws_send_json(websocket, {
             "type": "error",
             "message": f"Server '{name}' is not registered. Please register first."
         })
-        await websocket.close()
+        await _ws_close(websocket)
         return
     
     server_data = existing.data[0]
@@ -1557,20 +1577,20 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         device_id,
     )
     if not lease_ok:
-        await websocket.send_json({
+        await _ws_send_json(websocket, {
             "type": "error",
             "message": lease_error or "Tunnel provider lease rejected",
         })
-        await websocket.close()
+        await _ws_close(websocket)
         return
     
     # Check if server is active
     if server_data.get("status") != "active":
-        await websocket.send_json({
+        await _ws_send_json(websocket, {
             "type": "error",
             "message": f"Server '{name}' is not active (status: {server_data.get('status')})"
         })
-        await websocket.close()
+        await _ws_close(websocket)
         return
     
     # Note: We skip IP verification for WebSocket tunnel connections because:
@@ -1598,15 +1618,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
     # even if the server_key in DB was accidentally overwritten with a UUID.
     tunnel_id = name
     
-    # Check if tunnel with this ID already exists
     old_ws = active_tunnels.get(tunnel_id)
-    if old_ws is not None and old_ws is not websocket:
-        try:
-            await old_ws.close()
-        except Exception:
-            pass
-        print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
-
     _claim_active_tunnel(tunnel_id, websocket)
 
     # Load per-project access flags from mcp_servers.description
@@ -1627,33 +1639,43 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         tunnel_public_flags[tunnel_id] = {"__default__": False}
 
     print(f"✓ Tunnel established: {tunnel_id} (display name: {server_data.get('name')})")
-    
-    # Send tunnel info to client
-    await websocket.send_json({
-        "type": "connected",
-        "tunnel_id": tunnel_id,
-        "public_url": f"https://tunneling-service.onrender.com/t/{tunnel_id}"
-    })
-    
-    # Heartbeat task to keep connection alive and detect disconnections
-    async def heartbeat():
-        """Send periodic pings to detect connection health"""
-        try:
-            while True:
-                await asyncio.sleep(20)  # Ping every 20 seconds (reduced from 30s)
-                try:
-                    _ensure_active_tunnel(tunnel_id, websocket)
-                    await websocket.send_json({"type": "ping", "timestamp": datetime.now().isoformat()})
-                except Exception as e:
-                    print(f"💔 Heartbeat failed for {tunnel_id}: {e}")
-                    break
-        except asyncio.CancelledError:
-            pass
-    
-    # Start heartbeat task
-    heartbeat_task = asyncio.create_task(heartbeat())
-    
+
+    heartbeat_task = None
     try:
+        # Confirm this socket first. Closing the predecessor before this send
+        # races: the old handler is often mid-send_json("connected") and
+        # uvicorn then reports an unhandled ASGI ClientDisconnected.
+        sent = await _ws_send_json(websocket, {
+            "type": "connected",
+            "tunnel_id": tunnel_id,
+            "public_url": f"https://tunneling-service.onrender.com/t/{tunnel_id}"
+        })
+        if not sent:
+            print(f"✗ Tunnel {tunnel_id} closed before connected ack")
+            return
+
+        if old_ws is not None and old_ws is not websocket:
+            await _ws_close(old_ws)
+            print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
+
+        async def heartbeat():
+            """Send periodic pings to detect connection health"""
+            try:
+                while True:
+                    await asyncio.sleep(20)  # Ping every 20 seconds (reduced from 30s)
+                    try:
+                        _ensure_active_tunnel(tunnel_id, websocket)
+                        if not await _ws_send_json(websocket, {"type": "ping", "timestamp": datetime.now().isoformat()}):
+                            print(f"💔 Heartbeat failed for {tunnel_id}: socket closed")
+                            break
+                    except Exception as e:
+                        print(f"💔 Heartbeat failed for {tunnel_id}: {e}")
+                        break
+            except asyncio.CancelledError:
+                pass
+
+        heartbeat_task = asyncio.create_task(heartbeat())
+
         # Listen for responses from client
         while True:
             try:
@@ -1733,7 +1755,8 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 # Client sent a ping - respond with pong
                 _ensure_active_tunnel(tunnel_id, websocket)
                 print(f"💓 Heartbeat received from {tunnel_id}, responding with pong")
-                await websocket.send_json({"type": "pong", "timestamp": data.get("timestamp", datetime.now().isoformat())})
+                if not await _ws_send_json(websocket, {"type": "pong", "timestamp": data.get("timestamp", datetime.now().isoformat())}):
+                    break
 
     except WebSocketDisconnect:
         print(f"✗ Tunnel disconnected: {tunnel_id}")
@@ -1741,7 +1764,8 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         print(f"✗ Tunnel error for {tunnel_id}: {e}")
     finally:
         # Clean up — only if this socket still owns the name
-        heartbeat_task.cancel()
+        if heartbeat_task:
+            heartbeat_task.cancel()
         released = _release_active_tunnel(tunnel_id, websocket)
 
         # Clean up any pending streaming requests for this tunnel
