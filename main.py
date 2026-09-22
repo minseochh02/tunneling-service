@@ -69,6 +69,41 @@ active_tunnels = {}  # {tunnel_id: websocket}
 pending_requests = {}  # {request_id: asyncio.Future}
 streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 
+
+def _claim_active_tunnel(tunnel_id: str, websocket: WebSocket) -> bool:
+    """Make this live socket routable under tunnel_id. True if the map changed."""
+    if active_tunnels.get(tunnel_id) is websocket:
+        return False
+    active_tunnels[tunnel_id] = websocket
+    return True
+
+
+def _release_active_tunnel(tunnel_id: str, websocket: WebSocket) -> bool:
+    """Drop routing only if this socket still owns the name.
+
+    Reconnects replace the dict entry, then the old handler's finally used to
+    delete by name and evict the live socket. HTTP then 404s while heartbeats
+    keep succeeding because the WS loop never re-checks the map.
+    """
+    if active_tunnels.get(tunnel_id) is not websocket:
+        return False
+    del active_tunnels[tunnel_id]
+    if tunnel_id in tunnel_public_flags:
+        del tunnel_public_flags[tunnel_id]
+    return True
+
+
+def _ensure_active_tunnel(tunnel_id: str, websocket: WebSocket) -> None:
+    """Re-bind a still-open socket if reconnect cleanup evicted it.
+
+    Only fills an empty slot. Never steal the name from a newer socket.
+    """
+    current = active_tunnels.get(tunnel_id)
+    if current is websocket or current is not None:
+        return
+    active_tunnels[tunnel_id] = websocket
+    print(f"🔧 Re-bound live tunnel '{tunnel_id}' into active_tunnels")
+
 # Session storage for authenticated iframe access
 # {session_token: {user_id, user_email, tunnel_id, created_at, expires_at}}
 iframe_sessions = {}
@@ -400,6 +435,13 @@ def remove_custom_domains_description(raw_description, domains: list[str]) -> st
             domain_project_map.pop(host, None)
         desc["domain_project_map"] = domain_project_map
         desc["domain_project_map_updated_at"] = datetime.utcnow().isoformat()
+
+    domain_device_map = desc.get("domain_device_map") or {}
+    if isinstance(domain_device_map, dict):
+        for host in remove_set:
+            domain_device_map.pop(host, None)
+        desc["domain_device_map"] = domain_device_map
+        desc["domain_device_map_updated_at"] = datetime.utcnow().isoformat()
 
     desc["custom_domain_updated_at"] = datetime.utcnow().isoformat()
     return json.dumps(desc)
@@ -1415,8 +1457,74 @@ async def delete_permission(permission_id: str, request: Request):
             }
         )
 
+def _parse_iso_timestamp(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        normalized = value.replace("Z", "+00:00")
+        return datetime.fromisoformat(normalized)
+    except Exception:
+        return None
+
+
+def _verify_tunnel_provider_lease(
+    owner_user_id: str | None,
+    tunnel_name: str,
+    device_id: str | None,
+) -> tuple[bool, str | None]:
+    """
+    When device_id is supplied, enforce Supabase tunnel_providers lease.
+    Legacy clients without device_id keep last-writer-wins behavior.
+    """
+    if not device_id:
+        return True, None
+
+    device_id = device_id.strip()
+    tunnel_name = tunnel_name.strip()
+    if not device_id or not tunnel_name or not owner_user_id:
+        return False, "device_id and registered server required for lease enforcement"
+
+    try:
+        result = (
+            supabase.table("tunnel_providers")
+            .select("provider_device_id, lease_expires_at")
+            .eq("owner_user_id", owner_user_id)
+            .eq("tunnel_name", tunnel_name)
+            .maybe_single()
+            .execute()
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "tunnel_providers" in message and ("does not exist" in message or "relation" in message):
+            print(f"⚠️  tunnel_providers table missing — skipping lease enforcement for {tunnel_name}")
+            return True, None
+        print(f"⚠️  Lease lookup failed for {tunnel_name}: {exc}")
+        return False, "Tunnel provider lease lookup failed"
+
+    row = result.data if result else None
+    if not row:
+        return False, "No active tunnel lease — claim provider lease in EGDesk before connecting"
+
+    holder = (row.get("provider_device_id") or "").strip()
+    expires_at = _parse_iso_timestamp(row.get("lease_expires_at"))
+    now = datetime.now(expires_at.tzinfo if expires_at and expires_at.tzinfo else None)
+
+    if not holder:
+        return False, "Invalid tunnel provider lease"
+
+    if expires_at and expires_at <= now:
+        if holder != device_id:
+            return False, "Tunnel provider lease expired for another device — retry claim"
+        return True, None
+
+    if holder != device_id:
+        return False, f"Tunnel '{tunnel_name}' lease held by another device"
+
+    return True, None
+
+
 @app.websocket("/tunnel/connect")
-async def tunnel_connect(websocket: WebSocket, name: str = None):
+async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str = None):
     """Client connects here to establish tunnel"""
     await websocket.accept()
     
@@ -1442,6 +1550,19 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
         return
     
     server_data = existing.data[0]
+
+    lease_ok, lease_error = _verify_tunnel_provider_lease(
+        server_data.get("owner_user_id"),
+        name,
+        device_id,
+    )
+    if not lease_ok:
+        await websocket.send_json({
+            "type": "error",
+            "message": lease_error or "Tunnel provider lease rejected",
+        })
+        await websocket.close()
+        return
     
     # Check if server is active
     if server_data.get("status") != "active":
@@ -1478,16 +1599,15 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
     tunnel_id = name
     
     # Check if tunnel with this ID already exists
-    if tunnel_id in active_tunnels:
-        # Close existing connection
-        old_ws = active_tunnels[tunnel_id]
+    old_ws = active_tunnels.get(tunnel_id)
+    if old_ws is not None and old_ws is not websocket:
         try:
             await old_ws.close()
-        except:
+        except Exception:
             pass
         print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
-    
-    active_tunnels[tunnel_id] = websocket
+
+    _claim_active_tunnel(tunnel_id, websocket)
 
     # Load per-project access flags from mcp_servers.description
     try:
@@ -1522,6 +1642,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
             while True:
                 await asyncio.sleep(20)  # Ping every 20 seconds (reduced from 30s)
                 try:
+                    _ensure_active_tunnel(tunnel_id, websocket)
                     await websocket.send_json({"type": "ping", "timestamp": datetime.now().isoformat()})
                 except Exception as e:
                     print(f"💔 Heartbeat failed for {tunnel_id}: {e}")
@@ -1605,10 +1726,12 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
 
             elif data["type"] == "pong":
                 # Client responded to ping - connection is healthy
+                _ensure_active_tunnel(tunnel_id, websocket)
                 print(f"💓 Heartbeat acknowledged for {tunnel_id}")
 
             elif data["type"] == "ping":
                 # Client sent a ping - respond with pong
+                _ensure_active_tunnel(tunnel_id, websocket)
                 print(f"💓 Heartbeat received from {tunnel_id}, responding with pong")
                 await websocket.send_json({"type": "pong", "timestamp": data.get("timestamp", datetime.now().isoformat())})
 
@@ -1617,12 +1740,9 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
     except Exception as e:
         print(f"✗ Tunnel error for {tunnel_id}: {e}")
     finally:
-        # Clean up
+        # Clean up — only if this socket still owns the name
         heartbeat_task.cancel()
-        if tunnel_id in active_tunnels:
-            del active_tunnels[tunnel_id]
-        if tunnel_id in tunnel_public_flags:
-            del tunnel_public_flags[tunnel_id]
+        released = _release_active_tunnel(tunnel_id, websocket)
 
         # Clean up any pending streaming requests for this tunnel
         dead_streams = [req_id for req_id, queue in streaming_requests.items() if req_id.startswith(tunnel_id)]
@@ -1630,7 +1750,10 @@ async def tunnel_connect(websocket: WebSocket, name: str = None):
             streaming_requests[req_id].put_nowait(None)
             del streaming_requests[req_id]
         
-        print(f"🧹 Cleaned up tunnel: {tunnel_id}")
+        if released:
+            print(f"🧹 Cleaned up tunnel: {tunnel_id}")
+        else:
+            print(f"🧹 Skipped cleanup for {tunnel_id} — a newer socket owns the name")
 
 @app.get("/t/{tunnel_id}/ping")
 async def ping_server(tunnel_id: str, request: Request):
@@ -2031,6 +2154,22 @@ async def set_tunnel_domain_mapping(tunnel_id: str, request: Request):
 
         desc_json["domain_project_map"] = domain_project_map
         desc_json["domain_project_map_updated_at"] = datetime.utcnow().isoformat()
+
+        device_id = body.get("device_id")
+        device_label = body.get("device_label")
+        if device_id:
+            domain_device_map = desc_json.get("domain_device_map") or {}
+            if not isinstance(domain_device_map, dict):
+                domain_device_map = {}
+            holder = {
+                "deviceId": str(device_id).strip(),
+                "label": str(device_label).strip() if device_label else None,
+                "updatedAt": datetime.utcnow().isoformat(),
+            }
+            for v in variants:
+                domain_device_map[v] = holder
+            desc_json["domain_device_map"] = domain_device_map
+            desc_json["domain_device_map_updated_at"] = datetime.utcnow().isoformat()
 
         supabase.table("mcp_servers").update({
             "description": json.dumps(desc_json)
