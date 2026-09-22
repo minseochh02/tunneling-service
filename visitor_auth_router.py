@@ -112,10 +112,62 @@ def normalize_origin(value: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def is_loopback_hostname(hostname: str) -> bool:
+    return hostname in ("localhost", "127.0.0.1", "[::1]")
+
+
 def is_localhost_origin(value: str) -> bool:
     try:
+        return is_loopback_hostname(urlparse(value).hostname or "")
+    except Exception:
+        return False
+
+
+def is_private_lan_hostname(hostname: str) -> bool:
+    match = re.match(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$", hostname)
+    if not match:
+        return False
+    a, b = int(match.group(1)), int(match.group(2))
+    if a == 10:
+        return True
+    if a == 172 and 16 <= b <= 31:
+        return True
+    if a == 192 and b == 168:
+        return True
+    return False
+
+
+def is_dev_site_origin(value: str) -> bool:
+    try:
         hostname = urlparse(value).hostname or ""
-        return hostname in ("localhost", "127.0.0.1", "[::1]")
+        return is_loopback_hostname(hostname) or is_private_lan_hostname(hostname)
+    except Exception:
+        return False
+
+
+def is_tunnel_mcp_root(value: str) -> bool:
+    try:
+        parsed = urlparse(value)
+        return (
+            parsed.hostname == "tunneling-service.onrender.com"
+            or (parsed.hostname or "").endswith(".egdesk.cloud")
+            or re.search(r"/t/[^/]+", parsed.path or "") is not None
+        )
+    except Exception:
+        return False
+
+
+def dev_origins_equivalent(a: str, b: str) -> bool:
+    try:
+        left = urlparse(a)
+        right = urlparse(b)
+        left_origin = f"{left.scheme}://{left.netloc}"
+        right_origin = f"{right.scheme}://{right.netloc}"
+        if left_origin == right_origin:
+            return True
+        if left.port != right.port:
+            return False
+        return is_loopback_hostname(left.hostname or "") and is_loopback_hostname(right.hostname or "")
     except Exception:
         return False
 
@@ -130,11 +182,19 @@ def resolve_visitor_oauth_redirect_to(
     egdesk_public_url: str,
     local_callback_origin: str = "http://localhost:54321",
 ) -> str:
-    if is_localhost_origin(return_to):
-        base = local_callback_origin.rstrip("/")
-        return f"{base}/auth/callback"
     base = egdesk_public_url.rstrip("/")
-    return f"{base}/visitor-auth/callback/{pending_id}"
+    local_base = local_callback_origin.rstrip("/")
+    encoded = quote(pending_id, safe="")
+
+    if is_localhost_origin(return_to):
+        return f"{local_base}/auth/callback"
+
+    if is_dev_site_origin(return_to):
+        if is_tunnel_mcp_root(base):
+            return f"{base}/visitor-auth/callback/{encoded}"
+        return f"{local_base}/auth/callback"
+
+    return f"{base}/visitor-auth/callback/{encoded}"
 
 
 def pending_id_from_callback_url(url: str) -> str | None:
@@ -161,7 +221,7 @@ def visitor_request_origin(request: Request) -> str | None:
 def assert_visitor_audience(audience: str, request_origin: str | None) -> None:
     if not request_origin:
         raise VisitorAudienceError("Missing site origin for visitor session.")
-    if request_origin != audience:
+    if request_origin != audience and not dev_origins_equivalent(audience, request_origin):
         raise VisitorAudienceError("Visitor session is not valid for this site.")
 
 
@@ -340,7 +400,7 @@ class VisitorAuthService:
         force_consent: bool = False,
     ) -> dict[str, Any]:
         audience = visitor_audience_from_return_to(return_to)
-        if request_origin and request_origin != audience:
+        if request_origin and request_origin != audience and not dev_origins_equivalent(audience, request_origin):
             raise ValueError("returnTo origin must match the site that started login.")
 
         resolved_scopes = resolve_visitor_google_scopes(scopes)
