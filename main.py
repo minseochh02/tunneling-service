@@ -21,6 +21,7 @@ from bizverify_router import bizverify_router, handle_bizverify_http
 from nps_router import nps_router, handle_nps_http
 from koneps_router import koneps_router, handle_koneps_http
 from bidnotice_router import bidnotice_router, handle_bidnotice_http
+from visitor_auth_router import handle_visitor_auth_http
 
 # Load environment variables
 load_dotenv()
@@ -574,6 +575,16 @@ async def route_custom_domain_request(path: str, request: Request):
             status_code=404,
             content={"error": f"Domain '{host}' is not configured"},
         )
+
+    # Visitor OAuth runs on the gateway — must work when the desktop tunnel is offline.
+    if (
+        path == "visitor-auth/callback"
+        or path.startswith("visitor-auth/callback/")
+        or path == "visitor-auth/tools/call"
+        or path == "visitor-google/tools/call"
+    ):
+        print(f"🔐 Visitor auth (custom domain {host}): {request.method} /{path} → tunnel {tunnel_id}")
+        return await handle_visitor_auth_http(tunnel_id, path, request, supabase)
 
     if tunnel_id not in active_tunnels:
         print(f"❌ Custom domain '{host}' resolved to tunnel '{tunnel_id}', but it is not in active_tunnels. Active tunnels: {list(active_tunnels.keys())}")
@@ -2343,6 +2354,19 @@ async def _handle_tunnel_request(
             )
             print(f"🍪 Tunnel path session set for /t/{tunnel_id}")
             return response
+
+    # ============================================
+    # Visitor Google OAuth — handled on this gateway, not forwarded to EGDesk.
+    # Login must work even when the desktop tunnel WebSocket is offline.
+    # ============================================
+    if (
+        path == "visitor-auth/callback"
+        or path.startswith("visitor-auth/callback/")
+        or path == "visitor-auth/tools/call"
+        or path == "visitor-google/tools/call"
+    ):
+        print(f"🔐 Visitor auth gateway: {request.method} /{path} for tunnel {tunnel_id}")
+        return await handle_visitor_auth_http(tunnel_id, path, request, supabase)
 
     # ============================================
     # Bizinfo (기업마당) — handled on this gateway, not forwarded to EGDesk.
