@@ -272,6 +272,21 @@ class VisitorAuthStore:
     def delete_pending(self, pending_id: str) -> None:
         self.supabase.table("visitor_auth_pending").delete().eq("id", pending_id).execute()
 
+    def localhost_pending_id(self, tunnel_id: str) -> str | None:
+        """Match newest localhost pending when OAuth bounced to /auth/callback."""
+        self._sweep()
+        result = (
+            self.supabase.table("visitor_auth_pending")
+            .select("id, return_to, created_at")
+            .eq("tunnel_id", tunnel_id)
+            .order("created_at", desc=True)
+            .execute()
+        )
+        for row in result.data or []:
+            if is_localhost_origin(row.get("return_to") or ""):
+                return row["id"]
+        return None
+
     def save_session(self, session: dict[str, Any]) -> None:
         self.supabase.table("visitor_auth_sessions").upsert(session).execute()
 
@@ -351,8 +366,13 @@ class VisitorAuthService:
             "scopes": resolved_scopes,
         }
 
-    async def complete_callback(self, browser_url: str) -> dict[str, str]:
+    async def complete_callback(self, browser_url: str, tunnel_id: str) -> dict[str, str]:
         pending_id = pending_id_from_callback_url(browser_url)
+        if not pending_id:
+            parsed = urlparse(browser_url)
+            path = parsed.path.rstrip("/") or "/"
+            if path == "/auth/callback":
+                pending_id = self.store.localhost_pending_id(tunnel_id)
         if not pending_id:
             raise ValueError("Missing visitor login id. Close this page and try Sign in with Google again.")
 
@@ -641,7 +661,7 @@ async def handle_visitor_auth_http(
             browser_url = body.get("url") if isinstance(body, dict) else None
             if not isinstance(browser_url, str) or not browser_url:
                 return JSONResponse(status_code=400, content={"success": False, "error": "Missing url"})
-            result = await service.complete_callback(browser_url)
+            result = await service.complete_callback(browser_url, tunnel_id)
             return JSONResponse(status_code=200, content={"success": True, **result})
 
         if path == "visitor-auth/tools/call":
