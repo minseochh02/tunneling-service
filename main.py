@@ -124,6 +124,66 @@ async def _ws_close(websocket: WebSocket) -> None:
     except Exception:
         pass
 
+
+# Per-socket takeover signal. Never close a Starlette WebSocket from another
+# handler — that leaves the old receive loop with
+# 'WebSocket is not connected. Need to call "accept" first.'
+tunnel_takeover: dict[int, asyncio.Event] = {}
+
+
+def _register_tunnel_session(websocket: WebSocket) -> asyncio.Event:
+    event = asyncio.Event()
+    tunnel_takeover[id(websocket)] = event
+    return event
+
+
+def _signal_tunnel_takeover(old_ws: WebSocket | None) -> None:
+    if old_ws is None:
+        return
+    event = tunnel_takeover.get(id(old_ws))
+    if event:
+        event.set()
+
+
+def _forget_tunnel_session(websocket: WebSocket) -> None:
+    tunnel_takeover.pop(id(websocket), None)
+
+
+def _session_replaced(tunnel_id: str, websocket: WebSocket, takeover: asyncio.Event) -> bool:
+    return takeover.is_set() or active_tunnels.get(tunnel_id) is not websocket
+
+
+async def _receive_until_takeover(
+    websocket: WebSocket, takeover: asyncio.Event
+) -> tuple[dict | None, str | None]:
+    """Wait for a JSON message or a replace signal. None, reason if the loop should stop."""
+    receive_task = asyncio.create_task(websocket.receive_json())
+    takeover_task = asyncio.create_task(takeover.wait())
+    done, pending = await asyncio.wait(
+        {receive_task, takeover_task},
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+        try:
+            await task
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    if takeover.is_set():
+        return None, "replaced"
+    if receive_task not in done:
+        return None, "replaced"
+
+    try:
+        return receive_task.result(), None
+    except json.JSONDecodeError as exc:
+        return None, f"invalid_json:{exc}"
+    except (WebSocketDisconnect, RuntimeError):
+        return None, "disconnected"
+    except Exception as exc:
+        return None, f"error:{exc}"
+
 # Session storage for authenticated iframe access
 # {session_token: {user_id, user_email, tunnel_id, created_at, expires_at}}
 iframe_sessions = {}
@@ -1618,8 +1678,12 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
     # even if the server_key in DB was accidentally overwritten with a UUID.
     tunnel_id = name
     
+    takeover = _register_tunnel_session(websocket)
     old_ws = active_tunnels.get(tunnel_id)
     _claim_active_tunnel(tunnel_id, websocket)
+    if old_ws is not None and old_ws is not websocket:
+        _signal_tunnel_takeover(old_ws)
+        print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
 
     # Load per-project access flags from mcp_servers.description
     try:
@@ -1654,15 +1718,13 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
             print(f"✗ Tunnel {tunnel_id} closed before connected ack")
             return
 
-        if old_ws is not None and old_ws is not websocket:
-            await _ws_close(old_ws)
-            print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
-
         async def heartbeat():
             """Send periodic pings to detect connection health"""
             try:
                 while True:
                     await asyncio.sleep(20)  # Ping every 20 seconds (reduced from 30s)
+                    if _session_replaced(tunnel_id, websocket, takeover):
+                        break
                     try:
                         _ensure_active_tunnel(tunnel_id, websocket)
                         if not await _ws_send_json(websocket, {"type": "ping", "timestamp": datetime.now().isoformat()}):
@@ -1678,24 +1740,27 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
 
         # Listen for responses from client
         while True:
-            try:
-                data = await websocket.receive_json()
-                print(f"📨 WebSocket message received: type={data.get('type')}, request_id={data.get('request_id')}")
-            except json.JSONDecodeError as json_error:
-                # JSON parsing error - log but continue
-                print(f"⚠️ Invalid JSON received: {json_error}")
+            if _session_replaced(tunnel_id, websocket, takeover):
+                print(f"🔌 Tunnel {tunnel_id} replaced — closing this socket")
+                await _ws_close(websocket)
+                break
+
+            data, receive_status = await _receive_until_takeover(websocket, takeover)
+            if receive_status and receive_status.startswith("invalid_json"):
+                print(f"⚠️ Invalid JSON received: {receive_status}")
                 continue
-            except (WebSocketDisconnect, RuntimeError) as disconnect_error:
-                # Connection closed - break out of loop
-                if "disconnect" in str(disconnect_error).lower():
-                    print(f"🔌 WebSocket disconnected: {tunnel_id}")
-                else:
-                    print(f"🔌 WebSocket error (connection closed): {tunnel_id} - {disconnect_error}")
+            if receive_status == "replaced" or _session_replaced(tunnel_id, websocket, takeover):
+                print(f"🔌 Tunnel {tunnel_id} replaced — closing this socket")
+                await _ws_close(websocket)
                 break
-            except Exception as e:
-                # Other errors - log and break to avoid infinite loop
-                print(f"❌ Unexpected WebSocket error: {e}")
+            if receive_status == "disconnected":
+                print(f"🔌 WebSocket disconnected: {tunnel_id}")
                 break
+            if receive_status or data is None:
+                print(f"❌ Unexpected WebSocket error: {receive_status}")
+                break
+
+            print(f"📨 WebSocket message received: type={data.get('type')}, request_id={data.get('request_id')}")
 
             if data["type"] == "response":
                 request_id = data["request_id"]
@@ -1766,6 +1831,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         # Clean up — only if this socket still owns the name
         if heartbeat_task:
             heartbeat_task.cancel()
+        _forget_tunnel_session(websocket)
         released = _release_active_tunnel(tunnel_id, websocket)
 
         # Clean up any pending streaming requests for this tunnel
