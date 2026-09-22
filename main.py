@@ -22,6 +22,7 @@ from nps_router import nps_router, handle_nps_http
 from koneps_router import koneps_router, handle_koneps_http
 from bidnotice_router import bidnotice_router, handle_bidnotice_http
 from visitor_auth_router import handle_visitor_auth_http
+from supabase_auth_config import update_auth_redirect_allowlist
 
 # Load environment variables
 load_dotenv()
@@ -795,12 +796,20 @@ async def register_custom_domains(request: Request):
             result = await add_custom_domain_to_render(domain)
             render_results.append(result)
 
+        auth_allowlist = {"updated": False, "patterns": []}
+        try:
+            auth_allowlist = await update_auth_redirect_allowlist(domains)
+        except Exception as allow_error:
+            print(f"⚠️ Custom domain Auth allow list update failed: {allow_error}")
+            auth_allowlist = {"updated": False, "patterns": [], "error": str(allow_error)}
+
         return {
             "success": True,
             "server_key": server_data.get("server_key"),
             "domains": domains,
             "render_configured": all(item.get("success") for item in render_results),
             "render_results": render_results,
+            "auth_allowlist": auth_allowlist,
         }
     except Exception as e:
         print(f"❌ Failed to register custom domains: {e}")
@@ -846,12 +855,20 @@ async def deregister_custom_domains(request: Request):
             result = await remove_custom_domain_from_render(domain)
             render_results.append(result)
 
+        auth_allowlist = {"updated": False, "patterns": []}
+        try:
+            auth_allowlist = await update_auth_redirect_allowlist(domains, remove=True)
+        except Exception as allow_error:
+            print(f"⚠️ Custom domain Auth allow list removal failed: {allow_error}")
+            auth_allowlist = {"updated": False, "patterns": [], "error": str(allow_error)}
+
         return {
             "success": True,
             "server_key": server_data.get("server_key"),
             "domains": domains,
             "render_removed": all(item.get("success") for item in render_results),
             "render_results": render_results,
+            "auth_allowlist": auth_allowlist,
         }
     except Exception as e:
         print(f"❌ Failed to deregister custom domains: {e}")

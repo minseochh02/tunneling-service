@@ -419,6 +419,14 @@ class VisitorAuthService:
         pending_id = new_id(18)
         redirect_to = resolve_visitor_oauth_redirect_to(pending_id, return_to, egdesk_public_url)
 
+        # Custom-domain redirectTo must be in uri_allow_list or GoTrue falls back to site_url.
+        try:
+            from supabase_auth_config import ensure_visitor_redirect_allowed
+
+            await ensure_visitor_redirect_allowed(redirect_to, return_to)
+        except Exception as allow_error:
+            print(f"[visitor-auth] Redirect allow list update failed: {allow_error}")
+
         self.store.save_pending(pending_id, tunnel_id, return_to, audience, resolved_scopes)
 
         query_parts = [
