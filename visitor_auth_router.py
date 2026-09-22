@@ -3,6 +3,18 @@ Visitor Google OAuth — handled on the tunnel gateway (Render), not forwarded t
 
 Published sites never receive Supabase keys. OAuth start, callback completion, code exchange,
 and visitor Drive/Sheets reads run here so login does not depend on a live WebSocket tunnel.
+
+OAuth bounce routing (mirrors desktop visitor-auth-origin.ts):
+
+| Site type                        | Google redirectTo                              |
+|----------------------------------|------------------------------------------------|
+| Loopback (localhost / 127.0.0.1) | http://localhost:54321/auth/callback (exact)   |
+| LAN IP + tunnel MCP configured   | {MCP root}/visitor-auth/callback/{pendingId}   |
+| LAN IP, no tunnel (same PC only) | http://localhost:54321/auth/callback           |
+| Tunnel / custom domain           | {MCP root}/visitor-auth/callback/{pendingId}   |
+
+Hosted-coding prod ports (:3000) and dev ports (:4000) bind 0.0.0.0 for LAN access.
+Session checks treat localhost and 127.0.0.1 on the same port as equivalent audiences.
 """
 
 from __future__ import annotations
