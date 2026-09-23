@@ -20,6 +20,28 @@ def strip_tunnel_path_prefix(path: str, tunnel_id: str | None = None) -> str:
     return parts[2] if len(parts) > 2 else ""
 
 
+def visitor_gateway_path(path: str, tunnel_id: str | None = None) -> str | None:
+    """
+    Path the gateway should handle itself for visitor OAuth.
+
+    Custom-domain hosts already identify the tunnel, but clients sometimes copy the
+    shared-host prefix and send /t/{id}/visitor-auth/callback/{pendingId}. Strip that
+    (and an optional /p/{project}/) so the request is not forwarded to Next.js.
+    """
+    normalized = strip_tunnel_path_prefix((path or "").lstrip("/"), tunnel_id)
+    if normalized.startswith("t/"):
+        normalized = strip_tunnel_path_prefix(normalized, None)
+    if normalized.startswith("p/"):
+        parts = normalized.split("/", 2)
+        normalized = parts[2] if len(parts) > 2 else ""
+
+    if normalized == "visitor-auth/callback" or normalized.startswith("visitor-auth/callback/"):
+        return normalized
+    if normalized in ("visitor-auth/tools/call", "visitor-google/tools/call"):
+        return normalized
+    return None
+
+
 def inject_custom_domain_project_path(path: str, project_name: str, tunnel_id: str | None = None) -> str:
     """
     Prefix a bare custom-domain path with p/{project}/ for the tunnel client.

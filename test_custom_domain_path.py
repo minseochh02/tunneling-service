@@ -2,7 +2,11 @@
 
 import unittest
 
-from custom_domain_path import inject_custom_domain_project_path, strip_tunnel_path_prefix
+from custom_domain_path import (
+    inject_custom_domain_project_path,
+    strip_tunnel_path_prefix,
+    visitor_gateway_path,
+)
 
 
 class CustomDomainPathTests(unittest.TestCase):
@@ -33,6 +37,27 @@ class CustomDomainPathTests(unittest.TestCase):
     def test_strip_tunnel_prefix_only(self):
         self.assertEqual(strip_tunnel_path_prefix("t/abc/p/foo/bar", "abc"), "p/foo/bar")
         self.assertEqual(strip_tunnel_path_prefix("t/abc/assets/x.js", "abc"), "assets/x.js")
+
+    def test_visitor_callback_strips_tunnel_prefix_on_custom_domain(self):
+        self.assertEqual(
+            visitor_gateway_path(
+                "t/mcp-server-fxkud1/visitor-auth/callback/abc",
+                "mcp-server-fxkud1",
+            ),
+            "visitor-auth/callback/abc",
+        )
+        self.assertEqual(
+            visitor_gateway_path("visitor-auth/callback/abc", "mcp-server-fxkud1"),
+            "visitor-auth/callback/abc",
+        )
+        self.assertEqual(
+            visitor_gateway_path(
+                "t/mcp-server-fxkud1/p/SheetBot/visitor-auth/callback/abc",
+                "mcp-server-fxkud1",
+            ),
+            "visitor-auth/callback/abc",
+        )
+        self.assertIsNone(visitor_gateway_path("t/mcp-server-fxkud1/p/SheetBot/login", "mcp-server-fxkud1"))
 
 
 if __name__ == "__main__":

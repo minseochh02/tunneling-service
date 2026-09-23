@@ -188,13 +188,31 @@ def visitor_audience_from_return_to(return_to: str) -> str:
     return normalize_origin(return_to)
 
 
+def sanitize_visitor_oauth_base(return_to: str, egdesk_public_url: str) -> str:
+    """Drop /t/{id} when the MCP root is a custom domain. Gateway routes those by Host."""
+    base = egdesk_public_url.rstrip("/")
+    try:
+        public = urlparse(base)
+        site = urlparse(return_to)
+    except Exception:
+        return base
+    hostname = public.hostname or ""
+    if hostname == "tunneling-service.onrender.com" or hostname.endswith(".egdesk.cloud"):
+        return base
+    if not re.match(r"^/t/[^/]+", public.path or ""):
+        return base
+    if site.scheme in ("http", "https") and site.netloc and not is_dev_site_origin(return_to):
+        return f"{site.scheme}://{site.netloc}"
+    return f"{public.scheme}://{public.netloc}"
+
+
 def resolve_visitor_oauth_redirect_to(
     pending_id: str,
     return_to: str,
     egdesk_public_url: str,
     local_callback_origin: str = "http://localhost:54321",
 ) -> str:
-    base = egdesk_public_url.rstrip("/")
+    base = sanitize_visitor_oauth_base(return_to, egdesk_public_url)
     local_base = local_callback_origin.rstrip("/")
     encoded = quote(pending_id, safe="")
 

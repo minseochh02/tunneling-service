@@ -1,4 +1,4 @@
-from custom_domain_path import inject_custom_domain_project_path, strip_tunnel_path_prefix
+from custom_domain_path import inject_custom_domain_project_path, strip_tunnel_path_prefix, visitor_gateway_path
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, Cookie
 from starlette.websockets import WebSocketState
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -578,14 +578,11 @@ async def route_custom_domain_request(path: str, request: Request):
         )
 
     # Visitor OAuth runs on the gateway — must work when the desktop tunnel is offline.
-    if (
-        path == "visitor-auth/callback"
-        or path.startswith("visitor-auth/callback/")
-        or path == "visitor-auth/tools/call"
-        or path == "visitor-google/tools/call"
-    ):
+    # Also accept /t/{id}/visitor-auth/... on a custom domain; the host already names the tunnel.
+    gateway_path = visitor_gateway_path(path, tunnel_id)
+    if gateway_path:
         print(f"🔐 Visitor auth (custom domain {host}): {request.method} /{path} → tunnel {tunnel_id}")
-        return await handle_visitor_auth_http(tunnel_id, path, request, supabase)
+        return await handle_visitor_auth_http(tunnel_id, gateway_path, request, supabase)
 
     if tunnel_id not in active_tunnels:
         print(f"❌ Custom domain '{host}' resolved to tunnel '{tunnel_id}', but it is not in active_tunnels. Active tunnels: {list(active_tunnels.keys())}")

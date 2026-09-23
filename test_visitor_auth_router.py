@@ -36,6 +36,17 @@ class VisitorAuthRouterTests(unittest.TestCase):
         )
         self.assertEqual(redirect, "http://localhost:54321/auth/callback")
 
+    def test_custom_domain_strips_tunnel_path(self):
+        redirect = resolve_visitor_oauth_redirect_to(
+            "abc123",
+            "https://sheetbot.cloud/auth/callback",
+            "https://sheetbot.cloud/t/mcp-server-fxkud1",
+        )
+        self.assertEqual(
+            redirect,
+            "https://sheetbot.cloud/visitor-auth/callback/abc123",
+        )
+
     def test_pending_id_from_path(self):
         self.assertEqual(
             pending_id_from_callback_url(
