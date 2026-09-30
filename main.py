@@ -32,6 +32,8 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID")
+# Max seconds to wait for a tunnel client response before returning 504 to the browser.
+TUNNEL_REQUEST_TIMEOUT_SECONDS = float(os.getenv("TUNNEL_REQUEST_TIMEOUT_SECONDS", "60"))
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
@@ -2986,15 +2988,39 @@ async def _handle_tunnel_request(
             # Send request to client through WebSocket
             print(f"📤 Sending request {request_id} to client via WebSocket")
             await websocket.send_json(request_data)
-            # Wait for response — no timeout, let requests take as long as needed.
-            # The client-side browser/fetch timeout will handle hung requests.
-            print(f"⏳ Waiting for response to request {request_id} (no timeout)")
-            response_data = await future
+            print(
+                f"⏳ Waiting for response to request {request_id} "
+                f"(timeout {TUNNEL_REQUEST_TIMEOUT_SECONDS}s)"
+            )
+            try:
+                response_data = await asyncio.wait_for(
+                    future,
+                    timeout=TUNNEL_REQUEST_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                pending_requests.pop(request_id, None)
+                print(
+                    f"⏱️ Tunnel request {request_id} timed out after "
+                    f"{TUNNEL_REQUEST_TIMEOUT_SECONDS}s (tunnel {tunnel_id}, path /{path})"
+                )
+                return JSONResponse(
+                    status_code=504,
+                    content={
+                        "error": "Gateway timeout",
+                        "message": (
+                            f"The tunnel client for '{tunnel_id}' did not respond within "
+                            f"{int(TUNNEL_REQUEST_TIMEOUT_SECONDS)} seconds. "
+                            "Ensure EGDesk is running, the production tunnel is connected, "
+                            "and the hosted project's production server is started."
+                        ),
+                        "tunnel_id": tunnel_id,
+                    },
+                )
 
             print(f"✅ Received response for {request_id}, status: {response_data.get('status_code')}")
 
             # Clean up
-            del pending_requests[request_id]
+            pending_requests.pop(request_id, None)
 
             # Get headers and remove Content-Length (let FastAPI recalculate it)
             # This is important because the tunnel client may have injected content (like <base> tags)
@@ -3029,8 +3055,7 @@ async def _handle_tunnel_request(
             return response
 
         except Exception as e:
-            if request_id in pending_requests:
-                del pending_requests[request_id]
+            pending_requests.pop(request_id, None)
             return JSONResponse(
                 status_code=500,
                 content={"error": str(e)}
