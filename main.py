@@ -1574,6 +1574,19 @@ def _parse_iso_timestamp(value: str | None) -> datetime | None:
         return None
 
 
+def _is_missing_lease_row(exc: Exception) -> bool:
+    """postgrest maybe_single() raises on zero rows instead of returning None."""
+    message = str(exc).lower()
+    return (
+        "204" in message
+        or "missing response" in message
+        or "0 rows" in message
+        or "no rows" in message
+        or "pgrst116" in message
+        or "cannot coerce the result to a single json object" in message
+    )
+
+
 def _verify_tunnel_provider_lease(
     owner_user_id: str | None,
     tunnel_name: str,
@@ -1605,12 +1618,16 @@ def _verify_tunnel_provider_lease(
         if "tunnel_providers" in message and ("does not exist" in message or "relation" in message):
             print(f"⚠️  tunnel_providers table missing — skipping lease enforcement for {tunnel_name}")
             return True, None
+        if _is_missing_lease_row(exc):
+            print(f"⚠️  No tunnel lease row for {tunnel_name} — allowing connect")
+            return True, None
         print(f"⚠️  Lease lookup failed for {tunnel_name}: {exc}")
         return False, "Tunnel provider lease lookup failed"
 
     row = result.data if result else None
     if not row:
-        return False, "No active tunnel lease — claim provider lease in EGDesk before connecting"
+        print(f"⚠️  No tunnel lease row for {tunnel_name} — allowing connect")
+        return True, None
 
     holder = (row.get("provider_device_id") or "").strip()
     expires_at = _parse_iso_timestamp(row.get("lease_expires_at"))
