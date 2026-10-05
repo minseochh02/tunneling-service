@@ -34,6 +34,14 @@ RENDER_API_KEY = os.getenv("RENDER_API_KEY")
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID")
 # Max seconds to wait for a tunnel client response before returning 504 to the browser.
 TUNNEL_REQUEST_TIMEOUT_SECONDS = float(os.getenv("TUNNEL_REQUEST_TIMEOUT_SECONDS", "60"))
+# When true, send body_encoding=base64 for binary/non-UTF-8 bodies — only to clients
+# that advertised the body_base64 capability in their WS hello.
+# Default on so staging/prod can exercise the path; set TUNNEL_BODY_BASE64_ENABLED=false to disable.
+TUNNEL_BODY_BASE64_ENABLED = os.getenv("TUNNEL_BODY_BASE64_ENABLED", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
 if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
     raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
@@ -73,6 +81,8 @@ active_tunnels = {}  # {tunnel_id: websocket}
 # tunnel_api_keys = {}  # REMOVED: Now stored in Supabase 'mcp_servers' table
 pending_requests = {}  # {request_id: asyncio.Future}
 streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
+# Capabilities advertised by the desktop client via WS hello (e.g. {"body_base64"}).
+tunnel_capabilities: dict[str, set[str]] = {}
 
 
 def _claim_active_tunnel(tunnel_id: str, websocket: WebSocket) -> bool:
@@ -95,7 +105,50 @@ def _release_active_tunnel(tunnel_id: str, websocket: WebSocket) -> bool:
     del active_tunnels[tunnel_id]
     if tunnel_id in tunnel_public_flags:
         del tunnel_public_flags[tunnel_id]
+    tunnel_capabilities.pop(tunnel_id, None)
     return True
+
+
+def _encode_tunnel_request_body(
+    raw: bytes,
+    content_type: str,
+    tunnel_id: str,
+) -> tuple[str | None, str | None]:
+    """
+    Encode a request body for the WS JSON frame.
+    Returns (body_str, body_encoding) where body_encoding is 'base64' or None (legacy UTF-8).
+    """
+    if not raw:
+        return None, None
+
+    import base64
+
+    caps = tunnel_capabilities.get(tunnel_id) or set()
+    ct = (content_type or "").lower()
+    is_textish = (
+        ct.startswith("application/json")
+        or ct.startswith("text/")
+        or ct.startswith("application/x-www-form-urlencoded")
+        or "charset=utf-8" in ct
+    )
+    is_binaryish = (
+        ct.startswith("multipart/")
+        or ct.startswith("application/octet-stream")
+        or (bool(ct) and not is_textish)
+    )
+    can_base64 = TUNNEL_BODY_BASE64_ENABLED and "body_base64" in caps
+
+    if can_base64 and is_binaryish:
+        return base64.b64encode(raw).decode("ascii"), "base64"
+
+    # Prefer UTF-8 when possible; fall back to base64 only when the client supports it.
+    try:
+        return raw.decode("utf-8"), None
+    except UnicodeDecodeError:
+        if can_base64:
+            return base64.b64encode(raw).decode("ascii"), "base64"
+        # Legacy clients: lossy decode so something still arrives (may corrupt binary).
+        return raw.decode("utf-8", errors="replace"), None
 
 
 def _ensure_active_tunnel(tunnel_id: str, websocket: WebSocket) -> None:
@@ -1832,6 +1885,16 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 if request_id in streaming_requests:
                     await streaming_requests[request_id].put(None)  # Signal end
 
+            elif data.get("type") == "hello":
+                # Desktop client advertises protocol version + capabilities (e.g. body_base64).
+                caps_raw = data.get("capabilities") or []
+                caps = {str(c) for c in caps_raw if c}
+                tunnel_capabilities[tunnel_id] = caps
+                print(
+                    f"🤝 Hello from {tunnel_id}: protocol_version={data.get('protocol_version')} "
+                    f"capabilities={sorted(caps)}"
+                )
+
             elif data.get("type") == "register_api_key":
                 api_key = data.get("api_key")
                 if api_key:
@@ -2893,9 +2956,16 @@ async def _handle_tunnel_request(
 
     websocket = active_tunnels[tunnel_id]
     request_id = str(uuid.uuid4())
+    t0 = time.time()
 
     # Read request body
     body = await request.body()
+    body_bytes = len(body) if body else 0
+    print(
+        f"📥 [tunnel-req {request_id}] gateway_received "
+        f"method={request.method} path=/{path} body_bytes={body_bytes} "
+        f"tunnel={tunnel_id} elapsed_ms={int((time.time() - t0) * 1000)}"
+    )
 
     # Check if this is a coding project route (/p/{project_name}/...)
     full_path = "/" + path
@@ -2916,6 +2986,12 @@ async def _handle_tunnel_request(
     forwarded_headers = dict(request.headers)
     forwarded_headers["x-forwarded-host"] = request.headers.get("host", "tunneling-service.onrender.com")
 
+    body_str, body_encoding = _encode_tunnel_request_body(
+        body or b"",
+        request.headers.get("content-type", ""),
+        tunnel_id,
+    )
+
     request_data = {
         "type": "request",
         "request_id": request_id,
@@ -2923,9 +2999,12 @@ async def _handle_tunnel_request(
         "path": full_path,
         "headers": forwarded_headers,
         "query_params": dict(request.query_params),
-        "body": body.decode() if body else None,
-        "tunnel_id": tunnel_id  # Include tunnel_id for base path construction
+        "body": body_str,
+        "tunnel_id": tunnel_id,  # Include tunnel_id for base path construction
+        "gateway_received_at_ms": int(t0 * 1000),
     }
+    if body_encoding:
+        request_data["body_encoding"] = body_encoding
     
     # Check if this is an SSE request (GET to /sse endpoint)
     is_sse = request.method == "GET" and ("/sse" in path or path.endswith("/sse"))
@@ -3003,10 +3082,14 @@ async def _handle_tunnel_request(
 
         try:
             # Send request to client through WebSocket
-            print(f"📤 Sending request {request_id} to client via WebSocket")
+            print(
+                f"📤 [tunnel-req {request_id}] gateway_send_json "
+                f"body_bytes={body_bytes} encoding={body_encoding or 'utf8'} "
+                f"elapsed_ms={int((time.time() - t0) * 1000)}"
+            )
             await websocket.send_json(request_data)
             print(
-                f"⏳ Waiting for response to request {request_id} "
+                f"⏳ [tunnel-req {request_id}] waiting "
                 f"(timeout {TUNNEL_REQUEST_TIMEOUT_SECONDS}s)"
             )
             try:
@@ -3017,13 +3100,16 @@ async def _handle_tunnel_request(
             except asyncio.TimeoutError:
                 pending_requests.pop(request_id, None)
                 print(
-                    f"⏱️ Tunnel request {request_id} timed out after "
-                    f"{TUNNEL_REQUEST_TIMEOUT_SECONDS}s (tunnel {tunnel_id}, path /{path})"
+                    f"⏱️ [tunnel-req {request_id}] gateway_timeout "
+                    f"after {TUNNEL_REQUEST_TIMEOUT_SECONDS}s tunnel={tunnel_id} path=/{path} "
+                    f"elapsed_ms={int((time.time() - t0) * 1000)}"
                 )
                 return JSONResponse(
                     status_code=504,
                     content={
-                        "error": "Gateway timeout",
+                        "error": "tunnel_timeout",
+                        "retryable": True,
+                        "request_id": request_id,
                         "message": (
                             f"The tunnel client for '{tunnel_id}' did not respond within "
                             f"{int(TUNNEL_REQUEST_TIMEOUT_SECONDS)} seconds. "
@@ -3034,7 +3120,12 @@ async def _handle_tunnel_request(
                     },
                 )
 
-            print(f"✅ Received response for {request_id}, status: {response_data.get('status_code')}")
+            resp_body_len = len(response_data.get("body") or "")
+            print(
+                f"✅ [tunnel-req {request_id}] gateway_response_sent "
+                f"status={response_data.get('status_code')} resp_bytes={resp_body_len} "
+                f"elapsed_ms={int((time.time() - t0) * 1000)}"
+            )
 
             # Clean up
             pending_requests.pop(request_id, None)
