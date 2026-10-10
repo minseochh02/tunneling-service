@@ -1,8 +1,12 @@
 """
-Visitor Google OAuth — handled on the tunnel gateway (Render), not forwarded to EGDesk desktop.
+Visitor Google OAuth — platform flow on the tunnel gateway (Supabase pending in path).
 
-Published sites never receive Supabase keys. OAuth start, callback completion, code exchange,
-and visitor Drive/Sheets reads run here so login does not depend on a live WebSocket tunnel.
+BYO operator/end-user GCP login uses GET /visitor-auth/callback?code&state (no path segment);
+the gateway forwards that GET to the desktop MCP (see visitor_auth_byo_gateway.py).
+
+Published sites never receive Supabase keys for platform visitor login. Platform OAuth start,
+/callback/{pendingId} completion, code exchange, and visitor Drive/Sheets reads run here when
+the desktop tunnel is offline for platform-only flows.
 
 OAuth bounce routing (mirrors desktop visitor-auth-origin.ts):
 
@@ -742,13 +746,20 @@ async def handle_visitor_auth_http(
     origin = visitor_request_origin(request)
 
     try:
-        if path == "visitor-auth/callback" or (
-            path.startswith("visitor-auth/callback/") and not path.endswith("/complete")
-        ):
+        if path.startswith("visitor-auth/callback/") and not path.endswith("/complete"):
             if request.method != "GET":
                 return JSONResponse(status_code=405, content={"success": False, "error": "Method not allowed"})
-            print(f"🔐 Visitor OAuth callback page for tunnel {tunnel_id}")
+            print(f"🔐 Visitor platform OAuth callback tunnel={tunnel_id} path=/visitor-auth/callback/{{pendingId}}")
             return HTMLResponse(content=CALLBACK_HTML, status_code=200)
+
+        if path == "visitor-auth/callback":
+            if request.method != "GET":
+                return JSONResponse(status_code=405, content={"success": False, "error": "Method not allowed"})
+            return HTMLResponse(
+                content="""<!DOCTYPE html><html><body style="font-family:system-ui;padding:24px">
+<p>Invalid sign-in callback. Close this page and try again from the site.</p></body></html>""",
+                status_code=400,
+            )
 
         if path == "visitor-auth/callback/complete" or path.startswith("visitor-auth/callback/") and path.endswith(
             "/complete"

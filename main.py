@@ -22,6 +22,12 @@ from nps_router import nps_router, handle_nps_http
 from koneps_router import koneps_router, handle_koneps_http
 from bidnotice_router import bidnotice_router, handle_bidnotice_http
 from visitor_auth_router import handle_visitor_auth_http
+from visitor_auth_byo_gateway import (
+    byo_tunnel_offline_response,
+    log_visitor_callback_path_only,
+    should_forward_byo_callback_to_desktop,
+    visitor_auth_handled_on_gateway,
+)
 from supabase_auth_config import update_auth_redirect_allowlist
 
 # Load environment variables
@@ -636,8 +642,14 @@ async def route_custom_domain_request(path: str, request: Request):
     # Also accept /t/{id}/visitor-auth/... on a custom domain; the host already names the tunnel.
     gateway_path = visitor_gateway_path(path, tunnel_id)
     if gateway_path:
-        print(f"🔐 Visitor auth (custom domain {host}): {request.method} /{path} → tunnel {tunnel_id}")
-        return await handle_visitor_auth_http(tunnel_id, gateway_path, request, supabase)
+        if should_forward_byo_callback_to_desktop(gateway_path, request):
+            log_visitor_callback_path_only("/visitor-auth/callback", tunnel_id, request.method)
+            if tunnel_id not in active_tunnels:
+                return byo_tunnel_offline_response()
+            return await _handle_tunnel_request(tunnel_id, gateway_path, request)
+        if visitor_auth_handled_on_gateway(gateway_path, request):
+            print(f"🔐 Visitor auth (custom domain {host}): {request.method} /{gateway_path} → tunnel {tunnel_id}")
+            return await handle_visitor_auth_http(tunnel_id, gateway_path, request, supabase)
 
     if tunnel_id not in active_tunnels:
         print(f"❌ Custom domain '{host}' resolved to tunnel '{tunnel_id}', but it is not in active_tunnels. Active tunnels: {list(active_tunnels.keys())}")
@@ -2452,16 +2464,20 @@ async def _handle_tunnel_request(
             return response
 
     # ============================================
-    # Visitor Google OAuth — handled on this gateway, not forwarded to EGDesk.
-    # Login must work even when the desktop tunnel WebSocket is offline.
+    # Visitor Google OAuth
+    # - BYO: GET /visitor-auth/callback?code&state → forward to desktop (below)
+    # - Platform: /visitor-auth/callback/{pendingId} + tools → gateway (Supabase)
     # ============================================
-    if (
-        path == "visitor-auth/callback"
-        or path.startswith("visitor-auth/callback/")
-        or path == "visitor-auth/tools/call"
-        or path == "visitor-google/tools/call"
-    ):
-        print(f"🔐 Visitor auth gateway: {request.method} /{path} for tunnel {tunnel_id}")
+    if should_forward_byo_callback_to_desktop(path, request):
+        log_visitor_callback_path_only("/visitor-auth/callback", tunnel_id, request.method)
+        if tunnel_id not in active_tunnels:
+            return byo_tunnel_offline_response()
+        # Fall through to WebSocket forward (do not call handle_visitor_auth_http).
+    elif visitor_auth_handled_on_gateway(path, request):
+        if path.startswith("visitor-auth/callback"):
+            log_visitor_callback_path_only(f"/{path}", tunnel_id, request.method)
+        else:
+            print(f"🔐 Visitor auth gateway: {request.method} /{path} for tunnel {tunnel_id}")
         return await handle_visitor_auth_http(tunnel_id, path, request, supabase)
 
     # ============================================
@@ -2985,6 +3001,8 @@ async def _handle_tunnel_request(
     # but x-forwarded-host takes precedence for origin validation checks.
     forwarded_headers = dict(request.headers)
     forwarded_headers["x-forwarded-host"] = request.headers.get("host", "tunneling-service.onrender.com")
+    if should_forward_byo_callback_to_desktop(path, request):
+        forwarded_headers["x-egdesk-visitor-client-ip"] = get_client_ip(request)
 
     body_str, body_encoding = _encode_tunnel_request_body(
         body or b"",
