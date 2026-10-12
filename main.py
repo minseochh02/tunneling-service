@@ -2415,10 +2415,10 @@ async def set_tunnel_domain_mapping(tunnel_id: str, request: Request):
 
         device_id = body.get("device_id")
         device_label = body.get("device_label")
-        if device_id:
-            domain_device_map = desc_json.get("domain_device_map") or {}
-            if not isinstance(domain_device_map, dict):
-                domain_device_map = {}
+        domain_device_map = desc_json.get("domain_device_map") or {}
+        if not isinstance(domain_device_map, dict):
+            domain_device_map = {}
+        if project_name and device_id:
             holder = {
                 "deviceId": str(device_id).strip(),
                 "label": str(device_label).strip() if device_label else None,
@@ -2426,6 +2426,11 @@ async def set_tunnel_domain_mapping(tunnel_id: str, request: Request):
             }
             for v in variants:
                 domain_device_map[v] = holder
+            desc_json["domain_device_map"] = domain_device_map
+            desc_json["domain_device_map_updated_at"] = datetime.utcnow().isoformat()
+        elif not project_name:
+            for v in variants:
+                domain_device_map.pop(v, None)
             desc_json["domain_device_map"] = domain_device_map
             desc_json["domain_device_map_updated_at"] = datetime.utcnow().isoformat()
 
