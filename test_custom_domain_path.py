@@ -3,7 +3,9 @@
 import unittest
 
 from custom_domain_path import (
+    inject_canonical_visitor_origin_headers,
     inject_custom_domain_project_path,
+    preferred_canonical_origin_for_project,
     preferred_canonical_origin_from_domain_map,
     strip_tunnel_path_prefix,
     visitor_gateway_path,
@@ -65,6 +67,80 @@ class CustomDomainPathTests(unittest.TestCase):
             {"www.shop.example": "App", "shop.example": "App"},
         )
         self.assertEqual(origin, "https://shop.example")
+
+    def test_preferred_canonical_origin_for_project_scoped(self):
+        domain_map = {
+            "solgemtoken.com": "egdesk-system-demo",
+            "www.solgemtoken.com": "egdesk-system-demo",
+            "sheetbot.cloud": "SheetBot",
+        }
+        self.assertEqual(
+            preferred_canonical_origin_for_project(domain_map, "egdesk-system-demo"),
+            "https://solgemtoken.com",
+        )
+        self.assertEqual(
+            preferred_canonical_origin_for_project(domain_map, "Sheetbot"),
+            "https://sheetbot.cloud",
+        )
+        self.assertIsNone(preferred_canonical_origin_for_project(domain_map, "unmapped-project"))
+
+    def test_vicky_cha4_sheetbot_tunnel_gets_no_canonical_headers(self):
+        """Regression: tunnel-wide canonical pick used to send Sheetbot → solgemtoken.com."""
+        domain_map = {
+            "solgemtoken.com": "egdesk-system-demo",
+            "www.solgemtoken.com": "egdesk-system-demo",
+        }
+        self.assertIsNone(preferred_canonical_origin_for_project(domain_map, "Sheetbot"))
+        headers = inject_canonical_visitor_origin_headers(
+            path="p/Sheetbot",
+            request_host="tunneling-service.onrender.com",
+            domain_project_map=domain_map,
+        )
+        self.assertEqual(headers, {})
+
+    def test_egdesk_system_demo_tunnel_url_gets_no_redirect_hints(self):
+        domain_map = {
+            "solgemtoken.com": "egdesk-system-demo",
+            "www.solgemtoken.com": "egdesk-system-demo",
+        }
+        self.assertEqual(
+            preferred_canonical_origin_for_project(domain_map, "egdesk-system-demo"),
+            "https://solgemtoken.com",
+        )
+        headers = inject_canonical_visitor_origin_headers(
+            path="p/egdesk-system-demo/",
+            request_host="tunneling-service.onrender.com",
+            domain_project_map=domain_map,
+        )
+        self.assertEqual(headers, {})
+
+    def test_inject_canonical_headers_for_www_alias_only(self):
+        domain_map = {
+            "solgemtoken.com": "egdesk-system-demo",
+            "www.solgemtoken.com": "egdesk-system-demo",
+        }
+        headers = inject_canonical_visitor_origin_headers(
+            path="dashboard",
+            request_host="www.solgemtoken.com",
+            domain_project_map=domain_map,
+            project_override="egdesk-system-demo",
+        )
+        self.assertEqual(
+            headers,
+            {
+                "x-egdesk-canonical-visitor-origin": "https://solgemtoken.com",
+                "x-egdesk-canonical-redirect-enabled": "1",
+            },
+        )
+        self.assertEqual(
+            inject_canonical_visitor_origin_headers(
+                path="",
+                request_host="solgemtoken.com",
+                domain_project_map=domain_map,
+                project_override="egdesk-system-demo",
+            ),
+            {},
+        )
 
 
 if __name__ == "__main__":

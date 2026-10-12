@@ -1,6 +1,6 @@
 from custom_domain_path import (
+    inject_canonical_visitor_origin_headers,
     inject_custom_domain_project_path,
-    preferred_canonical_origin_from_domain_map,
     strip_tunnel_path_prefix,
     visitor_gateway_path,
 )
@@ -3019,10 +3019,18 @@ async def _handle_tunnel_request(
         if server_result.data:
             desc = parse_description_json(server_result.data[0].get("description"))
             domain_project_map = desc.get("domain_project_map") or {}
-            canonical_origin = preferred_canonical_origin_from_domain_map(domain_project_map)
-            if canonical_origin:
-                forwarded_headers["x-egdesk-canonical-visitor-origin"] = canonical_origin
-                forwarded_headers["x-egdesk-canonical-redirect-enabled"] = "1"
+            request_host = request.headers.get(
+                "host", "tunneling-service.onrender.com"
+            )
+            # Per-project canonical only (never tunnel-wide). See inject_canonical_visitor_origin_headers.
+            forwarded_headers.update(
+                inject_canonical_visitor_origin_headers(
+                    path=path,
+                    request_host=request_host,
+                    domain_project_map=domain_project_map,
+                    project_override=project_override,
+                )
+            )
     except Exception as e:
         print(f"⚠️ Could not inject canonical visitor origin headers for {tunnel_id}: {e}")
 
