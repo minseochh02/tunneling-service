@@ -4,6 +4,7 @@ import unittest
 
 from custom_domain_path import (
     inject_custom_domain_project_path,
+    preferred_canonical_origin_from_domain_map,
     strip_tunnel_path_prefix,
     visitor_gateway_path,
 )
@@ -58,6 +59,12 @@ class CustomDomainPathTests(unittest.TestCase):
             "visitor-auth/callback/abc",
         )
         self.assertIsNone(visitor_gateway_path("t/mcp-server-fxkud1/p/SheetBot/login", "mcp-server-fxkud1"))
+
+    def test_preferred_canonical_origin_prefers_apex(self):
+        origin = preferred_canonical_origin_from_domain_map(
+            {"www.shop.example": "App", "shop.example": "App"},
+        )
+        self.assertEqual(origin, "https://shop.example")
 
 
 if __name__ == "__main__":

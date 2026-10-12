@@ -1,4 +1,9 @@
-from custom_domain_path import inject_custom_domain_project_path, strip_tunnel_path_prefix, visitor_gateway_path
+from custom_domain_path import (
+    inject_custom_domain_project_path,
+    preferred_canonical_origin_from_domain_map,
+    strip_tunnel_path_prefix,
+    visitor_gateway_path,
+)
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response, Cookie
 from starlette.websockets import WebSocketState
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -3007,6 +3012,19 @@ async def _handle_tunnel_request(
     forwarded_headers["x-forwarded-host"] = request.headers.get("host", "tunneling-service.onrender.com")
     if should_forward_byo_callback_to_desktop(path, request):
         forwarded_headers["x-egdesk-visitor-client-ip"] = get_client_ip(request)
+    try:
+        server_result = supabase.table("mcp_servers").select("description").or_(
+            f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
+        ).execute()
+        if server_result.data:
+            desc = parse_description_json(server_result.data[0].get("description"))
+            domain_project_map = desc.get("domain_project_map") or {}
+            canonical_origin = preferred_canonical_origin_from_domain_map(domain_project_map)
+            if canonical_origin:
+                forwarded_headers["x-egdesk-canonical-visitor-origin"] = canonical_origin
+                forwarded_headers["x-egdesk-canonical-redirect-enabled"] = "1"
+    except Exception as e:
+        print(f"⚠️ Could not inject canonical visitor origin headers for {tunnel_id}: {e}")
 
     body_str, body_encoding = _encode_tunnel_request_body(
         body or b"",

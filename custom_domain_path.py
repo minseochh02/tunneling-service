@@ -66,3 +66,24 @@ def inject_custom_domain_project_path(path: str, project_name: str, tunnel_id: s
         return f"p/{project}/{rest}" if rest else f"p/{project}"
 
     return f"p/{project}/{normalized}" if normalized else f"p/{project}"
+
+
+def preferred_canonical_origin_from_domain_map(domain_project_map: dict | None) -> str | None:
+    """
+    Pick a canonical https origin from domain_project_map keys (apex preferred over www).
+    Used to inject runtime redirect hints for Next.js middleware on the tunnel client.
+    """
+    if not domain_project_map or not isinstance(domain_project_map, dict):
+        return None
+    hosts = [str(h).strip().lower() for h in domain_project_map.keys() if str(h).strip()]
+    if not hosts:
+        return None
+
+    def sort_key(host: str) -> tuple[int, str]:
+        is_www = 1 if host.startswith("www.") else 0
+        bare = host[4:] if host.startswith("www.") else host
+        return (is_www, bare)
+
+    hosts.sort(key=sort_key)
+    chosen = hosts[0]
+    return f"https://{chosen}"
