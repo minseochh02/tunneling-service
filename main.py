@@ -96,7 +96,44 @@ app.add_middleware(
 active_tunnels = {}  # {tunnel_id: websocket}
 # tunnel_api_keys = {}  # REMOVED: Now stored in Supabase 'mcp_servers' table
 pending_requests = {}  # {request_id: asyncio.Future}
+pending_request_tunnels: dict[str, str] = {}  # request_id -> tunnel_id
 streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
+
+
+def fail_pending_requests_for_tunnel(tunnel_id: str, reason: str = "tunnel_disconnect") -> int:
+    """
+    When the desktop WebSocket drops mid-request, the client may finish locally but
+    fail to send the response frame. Fail open HTTP waits so browsers do not hang until
+    the gateway hour timeout.
+    """
+    to_fail = [rid for rid, tid in list(pending_request_tunnels.items()) if tid == tunnel_id]
+    count = 0
+    for rid in to_fail:
+        fut = pending_requests.pop(rid, None)
+        pending_request_tunnels.pop(rid, None)
+        if fut and not fut.done():
+            fut.set_result(
+                {
+                    "status_code": 503,
+                    "headers": {"content-type": "application/json"},
+                    "body": json.dumps(
+                        {
+                            "error": reason,
+                            "retryable": True,
+                            "request_id": rid,
+                            "message": (
+                                "Tunnel connection dropped before the response was delivered. "
+                                "Please retry the request."
+                            ),
+                            "tunnel_id": tunnel_id,
+                        }
+                    ),
+                }
+            )
+            count += 1
+    if count:
+        print(f"⚠️ Failed {count} pending HTTP request(s) for tunnel '{tunnel_id}' ({reason})")
+    return count
 # Capabilities advertised by the desktop client via WS hello (e.g. {"body_base64"}).
 tunnel_capabilities: dict[str, set[str]] = {}
 
@@ -1971,6 +2008,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
             del streaming_requests[req_id]
         
         if released:
+            fail_pending_requests_for_tunnel(tunnel_id)
             print(f"🧹 Cleaned up tunnel: {tunnel_id}")
         else:
             print(f"🧹 Skipped cleanup for {tunnel_id} — a newer socket owns the name")
@@ -3129,6 +3167,7 @@ async def _handle_tunnel_request(
         # Handle regular request/response
         future = asyncio.Future()
         pending_requests[request_id] = future
+        pending_request_tunnels[request_id] = tunnel_id
 
         try:
             # Send request to client through WebSocket
@@ -3155,6 +3194,7 @@ async def _handle_tunnel_request(
                     response_data = await future
             except asyncio.TimeoutError:
                 pending_requests.pop(request_id, None)
+                pending_request_tunnels.pop(request_id, None)
                 print(
                     f"⏱️ [tunnel-req {request_id}] gateway_timeout "
                     f"after {TUNNEL_REQUEST_TIMEOUT_SECONDS}s tunnel={tunnel_id} path=/{path} "
@@ -3185,6 +3225,7 @@ async def _handle_tunnel_request(
 
             # Clean up
             pending_requests.pop(request_id, None)
+            pending_request_tunnels.pop(request_id, None)
 
             # Get headers and remove Content-Length (let FastAPI recalculate it)
             # This is important because the tunnel client may have injected content (like <base> tags)
@@ -3220,6 +3261,7 @@ async def _handle_tunnel_request(
 
         except Exception as e:
             pending_requests.pop(request_id, None)
+            pending_request_tunnels.pop(request_id, None)
             return JSONResponse(
                 status_code=500,
                 content={"error": str(e)}
