@@ -1,6 +1,7 @@
 from custom_domain_path import (
     inject_canonical_visitor_origin_headers,
     inject_custom_domain_project_path,
+    resolve_custom_domain_forward_path,
     strip_tunnel_path_prefix,
     visitor_gateway_path,
 )
@@ -688,10 +689,11 @@ async def route_custom_domain_request(path: str, request: Request):
     # domain_project_map (synced from the local domain→project mapping) is the real source
     # of truth here; only fall back to path-extraction if this domain has no mapping saved.
     mapped_project = domain_project_map.get(host)
-    request_project = mapped_project or extract_project_from_path(path)
-    forward_path = path
-    if mapped_project:
-        forward_path = inject_custom_domain_project_path(path, mapped_project, tunnel_id)
+    forward_path, request_project = resolve_custom_domain_forward_path(
+        path, mapped_project, tunnel_id
+    )
+    if not request_project:
+        request_project = extract_project_from_path(path)
     is_public = is_project_public(tunnel_id, request_project)
 
     # ============================================

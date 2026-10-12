@@ -7,6 +7,7 @@ from custom_domain_path import (
     inject_custom_domain_project_path,
     preferred_canonical_origin_for_project,
     preferred_canonical_origin_from_domain_map,
+    resolve_custom_domain_forward_path,
     strip_tunnel_path_prefix,
     visitor_gateway_path,
 )
@@ -30,6 +31,15 @@ class CustomDomainPathTests(unittest.TestCase):
             inject_custom_domain_project_path("p/other/dashboard", "myapp"),
             "p/myapp/dashboard",
         )
+
+    def test_custom_domain_honors_explicit_sheetbot_on_mapped_demo_domain(self):
+        """solgemtoken.com → egdesk-system-demo but URL says /p/Sheetbot/ must stay Sheetbot."""
+        path = "t/vicky-cha4/p/Sheetbot/api/sheets/analyze"
+        forward, project = resolve_custom_domain_forward_path(
+            path, "egdesk-system-demo", "vicky-cha4"
+        )
+        self.assertEqual(project, "Sheetbot")
+        self.assertEqual(forward, "p/Sheetbot/api/sheets/analyze")
 
     def test_strip_tunnel_prefix_then_inject(self):
         self.assertEqual(

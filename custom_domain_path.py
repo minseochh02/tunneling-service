@@ -98,6 +98,41 @@ def extract_project_from_coding_path(path: str) -> str | None:
     return None
 
 
+def extract_project_after_tunnel_strip(path: str, tunnel_id: str | None = None) -> str | None:
+    """Project from path after optional /t/{tunnel_id}/ strip (custom-domain + tunnel URLs)."""
+    normalized = strip_tunnel_path_prefix((path or "").lstrip("/"), tunnel_id)
+    return extract_project_from_coding_path(normalized)
+
+
+def resolve_custom_domain_forward_path(
+    path: str,
+    mapped_project: str | None,
+    tunnel_id: str | None = None,
+) -> tuple[str, str | None]:
+    """
+    Custom-domain forward path + project for access checks.
+
+    When the browser uses a full tunnel URL on a custom host
+    (e.g. solgemtoken.com/t/vicky-cha4/p/Sheetbot/api/...), honor /p/Sheetbot/
+    instead of replacing it with domain_project_map (often a different default app).
+    """
+    mapped = (mapped_project or "").strip() or None
+    explicit = extract_project_after_tunnel_strip(path, tunnel_id)
+
+    if explicit and mapped and explicit.lower() != mapped.lower():
+        normalized = strip_tunnel_path_prefix((path or "").lstrip("/"), tunnel_id)
+        return normalized, explicit
+
+    if mapped:
+        return inject_custom_domain_project_path(path, mapped, tunnel_id), mapped
+
+    if explicit:
+        normalized = strip_tunnel_path_prefix((path or "").lstrip("/"), tunnel_id)
+        return normalized, explicit
+
+    return (path or "").lstrip("/"), None
+
+
 def _canonical_host_sort_key(host: str) -> tuple[int, str]:
     is_www = 1 if host.startswith("www.") else 0
     bare = host[4:] if host.startswith("www.") else host
