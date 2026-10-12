@@ -39,7 +39,11 @@ SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID")
 # Max seconds to wait for a tunnel client response before returning 504 to the browser.
-TUNNEL_REQUEST_TIMEOUT_SECONDS = float(os.getenv("TUNNEL_REQUEST_TIMEOUT_SECONDS", "60"))
+# Default 1 hour — long MCP/API work must not be cut off at 60s. Set <= 0 for no gateway timeout.
+_DEFAULT_TUNNEL_REQUEST_TIMEOUT = "3600"
+_raw_tunnel_timeout = os.getenv("TUNNEL_REQUEST_TIMEOUT_SECONDS", _DEFAULT_TUNNEL_REQUEST_TIMEOUT)
+TUNNEL_REQUEST_TIMEOUT_SECONDS = float(_raw_tunnel_timeout)
+TUNNEL_REQUEST_TIMEOUT_ENABLED = TUNNEL_REQUEST_TIMEOUT_SECONDS > 0
 # When true, send body_encoding=base64 for binary/non-UTF-8 bodies — only to clients
 # that advertised the body_base64 capability in their WS hello.
 # Default on so staging/prod can exercise the path; set TUNNEL_BODY_BASE64_ENABLED=false to disable.
@@ -3106,15 +3110,21 @@ async def _handle_tunnel_request(
                 f"elapsed_ms={int((time.time() - t0) * 1000)}"
             )
             await websocket.send_json(request_data)
-            print(
-                f"⏳ [tunnel-req {request_id}] waiting "
-                f"(timeout {TUNNEL_REQUEST_TIMEOUT_SECONDS}s)"
-            )
-            try:
-                response_data = await asyncio.wait_for(
-                    future,
-                    timeout=TUNNEL_REQUEST_TIMEOUT_SECONDS,
+            if TUNNEL_REQUEST_TIMEOUT_ENABLED:
+                print(
+                    f"⏳ [tunnel-req {request_id}] waiting "
+                    f"(timeout {TUNNEL_REQUEST_TIMEOUT_SECONDS}s)"
                 )
+            else:
+                print(f"⏳ [tunnel-req {request_id}] waiting (no gateway timeout)")
+            try:
+                if TUNNEL_REQUEST_TIMEOUT_ENABLED:
+                    response_data = await asyncio.wait_for(
+                        future,
+                        timeout=TUNNEL_REQUEST_TIMEOUT_SECONDS,
+                    )
+                else:
+                    response_data = await future
             except asyncio.TimeoutError:
                 pending_requests.pop(request_id, None)
                 print(
