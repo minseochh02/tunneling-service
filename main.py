@@ -29,11 +29,11 @@ from koneps_router import koneps_router, handle_koneps_http
 from bidnotice_router import bidnotice_router, handle_bidnotice_http
 from visitor_auth_router import handle_visitor_auth_http
 from visitor_auth_byo_gateway import (
-    byo_tunnel_offline_response,
     log_visitor_callback_path_only,
     should_forward_byo_callback_to_desktop,
     visitor_auth_handled_on_gateway,
 )
+from tunnel_offline_response import byo_tunnel_offline_response, tunnel_offline_response
 from supabase_auth_config import update_auth_redirect_allowlist
 
 # Load environment variables
@@ -692,7 +692,7 @@ async def route_custom_domain_request(path: str, request: Request):
         if should_forward_byo_callback_to_desktop(gateway_path, request):
             log_visitor_callback_path_only("/visitor-auth/callback", tunnel_id, request.method)
             if tunnel_id not in active_tunnels:
-                return byo_tunnel_offline_response()
+                return byo_tunnel_offline_response(request)
             return await _handle_tunnel_request(tunnel_id, gateway_path, request)
         if visitor_auth_handled_on_gateway(gateway_path, request):
             print(f"🔐 Visitor auth (custom domain {host}): {request.method} /{gateway_path} → tunnel {tunnel_id}")
@@ -700,10 +700,7 @@ async def route_custom_domain_request(path: str, request: Request):
 
     if tunnel_id not in active_tunnels:
         print(f"❌ Custom domain '{host}' resolved to tunnel '{tunnel_id}', but it is not in active_tunnels. Active tunnels: {list(active_tunnels.keys())}")
-        return JSONResponse(
-            status_code=503,
-            content={"error": f"Server for '{host}' is offline"},
-        )
+        return tunnel_offline_response(request, tunnel_id=tunnel_id, host=host)
 
     # Refresh per-project access flags from DB for custom domain requests
     # (in-memory flags may be stale if access mode changed after tunnel connected)
@@ -2525,7 +2522,7 @@ async def _handle_tunnel_request(
     if should_forward_byo_callback_to_desktop(path, request):
         log_visitor_callback_path_only("/visitor-auth/callback", tunnel_id, request.method)
         if tunnel_id not in active_tunnels:
-            return byo_tunnel_offline_response()
+            return byo_tunnel_offline_response(request)
         # Fall through to WebSocket forward (do not call handle_visitor_auth_http).
     elif visitor_auth_handled_on_gateway(path, request):
         if path.startswith("visitor-auth/callback"):
@@ -2758,9 +2755,11 @@ async def _handle_tunnel_request(
     # Check if tunnel exists locally
     if tunnel_id not in active_tunnels:
         print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
-        return JSONResponse(
-            status_code=404,
-            content={"error": "Tunnel not found or disconnected"}
+        host = normalize_host(request.headers.get("host"))
+        return tunnel_offline_response(
+            request,
+            tunnel_id=tunnel_id,
+            host=host if host and host not in PRIMARY_DOMAINS else None,
         )
 
     # ============================================

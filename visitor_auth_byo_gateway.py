@@ -13,16 +13,6 @@ class _VisitorCallbackRequest(Protocol):
     method: str
     query_params: Any
 
-BYO_TUNNEL_OFFLINE_HTML = """<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Sign-in unavailable</title></head>
-<body style="font-family: system-ui, sans-serif; padding: 24px;">
-  <p>Sign-in is temporarily unavailable because the operator's computer is offline.
-     Ask them to open EGDesk and connect the tunnel, then try again.</p>
-</body>
-</html>"""
-
-
 def is_direct_oauth_callback_query(request: _VisitorCallbackRequest) -> bool:
     code = request.query_params.get("code")
     state = request.query_params.get("state")
@@ -59,7 +49,3 @@ def log_visitor_callback_path_only(path: str, tunnel_id: str, method: str) -> No
     print(f"🔐 Visitor OAuth path={path} method={method} tunnel={tunnel_id}")
 
 
-def byo_tunnel_offline_response():
-    from fastapi.responses import HTMLResponse
-
-    return HTMLResponse(content=BYO_TUNNEL_OFFLINE_HTML, status_code=503)
