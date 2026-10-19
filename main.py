@@ -1046,6 +1046,31 @@ async def register_mcp(request: Request):
                     print(f"✅ Re-registration ownership verified via IP (legacy): {client_ip}")
             
             if is_owner:
+                existing_device_id = (existing_record.get("owner_device_id") or "").strip()
+                if (
+                    existing_device_id
+                    and owner_device_id
+                    and existing_device_id != owner_device_id
+                ):
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "success": False,
+                            "error": "tunnel_key_bound_to_other_device",
+                            "message": (
+                                f"Tunnel id '{server_key}' is already registered on another device "
+                                "for your account."
+                            ),
+                            "existing_record": {
+                                "id": existing_record.get("id"),
+                                "name": existing_record.get("name"),
+                                "server_key": existing_record.get("server_key"),
+                                "registered_at": existing_record.get("created_at"),
+                                "owner_device_id": existing_device_id,
+                            },
+                        },
+                    )
+
                 # Owner verified - update the record
                 update_data = {
                     "name": name,
