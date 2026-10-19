@@ -996,6 +996,7 @@ async def register_mcp(request: Request):
         connection_url = body.get("connection_url")
         max_concurrent_connections = body.get("max_concurrent_connections", 10)
         owner_email = body.get("owner_email")  # Optional: auto-add as invited user
+        owner_device_id = (body.get("owner_device_id") or body.get("device_id") or "").strip() or None
         
         if not name or not server_key:
             return JSONResponse(
@@ -1018,7 +1019,7 @@ async def register_mcp(request: Request):
             owner_email = user_email
         
         # Check if server_key is already taken
-        existing = supabase.table("mcp_servers").select("id, name, server_key, owner_user_id, owner_ip, owner_ip_salt, created_at").eq("server_key", server_key).execute()
+        existing = supabase.table("mcp_servers").select("id, name, server_key, owner_user_id, owner_device_id, owner_ip, owner_ip_salt, created_at").eq("server_key", server_key).execute()
         
         if existing.data and len(existing.data) > 0:
             existing_record = existing.data[0]
@@ -1054,6 +1055,8 @@ async def register_mcp(request: Request):
                     "updated_at": datetime.now().isoformat(),
                     "status": "active"
                 }
+                if owner_device_id:
+                    update_data["owner_device_id"] = owner_device_id
                 
                 # Upgrade legacy IP-only servers to User ID ownership
                 if ownership_method == "ip_legacy" and user_id:
@@ -1122,35 +1125,46 @@ async def register_mcp(request: Request):
                     }
                 )
         
-        # Server key doesn't exist - create new registration
-        # Enforce one MCP server per user (app-level check)
-        if user_id:
-            existing_user_servers = supabase.table("mcp_servers").select("id, name, server_key").eq("owner_user_id", user_id).execute()
-            if existing_user_servers.data and len(existing_user_servers.data) > 0:
-                existing_server = existing_user_servers.data[0]
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "success": False,
-                        "error": "User already has a registered server",
-                        "message": f"You already own server '{existing_server.get('name')}' (key: {existing_server.get('server_key')}). Each user can only have one MCP server.",
-                        "existing_server": {
-                            "name": existing_server.get("name"),
-                            "server_key": existing_server.get("server_key"),
-                            "id": existing_server.get("id")
-                        }
-                    }
-                )
+        # Server key doesn't exist - create new registration (one row per device when owner_device_id is set)
+        if user_id and owner_device_id:
+            existing_device_row = (
+                supabase.table("mcp_servers")
+                .select("id, name, server_key, owner_device_id")
+                .eq("owner_user_id", user_id)
+                .eq("owner_device_id", owner_device_id)
+                .execute()
+            )
+            if existing_device_row.data and len(existing_device_row.data) > 0:
+                bound = existing_device_row.data[0]
+                bound_key = (bound.get("server_key") or "").strip()
+                if bound_key and bound_key != server_key:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "success": False,
+                            "error": "Device already has a registered server",
+                            "message": f"This device already owns tunnel '{bound_key}'. Register that key or use a new device id.",
+                            "existing_server": {
+                                "name": bound.get("name"),
+                                "server_key": bound_key,
+                                "id": bound.get("id"),
+                            },
+                        },
+                    )
 
-        result = supabase.table("mcp_servers").insert({
+        insert_row = {
             "owner_user_id": user_id,
             "name": name,
             "description": description,
             "server_key": server_key,
             "connection_url": connection_url,
             "max_concurrent_connections": max_concurrent_connections,
-            "status": "active"
-        }).execute()
+            "status": "active",
+        }
+        if owner_device_id:
+            insert_row["owner_device_id"] = owner_device_id
+
+        result = supabase.table("mcp_servers").insert(insert_row).execute()
         
         if result.data and len(result.data) > 0:
             registered_data = result.data[0]
@@ -1222,7 +1236,7 @@ async def register_mcp(request: Request):
 
 @app.post("/register/confirm-selection")
 async def confirm_mcp_server_selection(request: Request):
-    """Keep one MCP server for the authenticated user and delete all other owned servers."""
+    """Link a legacy MCP server row to a device (does not delete other devices' tunnels)."""
     try:
         user_id, user_email = get_user_from_auth_header(request)
         if not user_id:
@@ -1237,6 +1251,7 @@ async def confirm_mcp_server_selection(request: Request):
 
         body = await request.json()
         server_key = (body.get("server_key") or "").strip().lower()
+        owner_device_id = (body.get("owner_device_id") or body.get("device_id") or "").strip() or None
         if not server_key:
             return JSONResponse(
                 status_code=400,
@@ -1247,15 +1262,15 @@ async def confirm_mcp_server_selection(request: Request):
                 },
             )
 
-        user_servers_result = (
+        keeper_result = (
             supabase.table("mcp_servers")
-            .select("id, name, server_key, created_at")
+            .select("id, name, server_key, owner_device_id, created_at")
             .eq("owner_user_id", user_id)
+            .eq("server_key", server_key)
             .execute()
         )
-        user_servers = user_servers_result.data or []
-
-        keeper = next((s for s in user_servers if s.get("server_key") == server_key), None)
+        keeper_rows = keeper_result.data or []
+        keeper = keeper_rows[0] if keeper_rows else None
         if not keeper:
             return JSONResponse(
                 status_code=404,
@@ -1266,63 +1281,35 @@ async def confirm_mcp_server_selection(request: Request):
                 },
             )
 
-        servers_to_delete = [s for s in user_servers if s.get("id") != keeper.get("id")]
-        deleted_keys: list[str] = []
-
-        for server in servers_to_delete:
-            server_id = server.get("id")
-            server_key_to_delete = server.get("server_key")
-            if not server_id:
-                continue
-
-            try:
-                permissions = (
-                    supabase.table("mcp_server_permissions")
-                    .select("id")
-                    .eq("server_id", server_id)
-                    .execute()
-                )
-                for permission in permissions.data or []:
-                    permission_id = permission.get("id")
-                    if permission_id:
-                        supabase.table("mcp_connection_sessions").delete().eq(
-                            "permission_id", permission_id
-                        ).execute()
-
-                supabase.table("mcp_server_permissions").delete().eq(
-                    "server_id", server_id
-                ).execute()
-                supabase.table("mcp_servers").delete().eq("id", server_id).execute()
-
-                if server_key_to_delete:
-                    deleted_keys.append(server_key_to_delete)
-                    print(
-                        f"🗑️ Deleted duplicate MCP server '{server_key_to_delete}' for user {user_email or user_id}"
-                    )
-            except Exception as delete_error:
-                print(
-                    f"❌ Failed to delete MCP server '{server_key_to_delete}' ({server_id}): {delete_error}"
-                )
+        existing_device = (keeper.get("owner_device_id") or "").strip()
+        if owner_device_id:
+            if existing_device and existing_device != owner_device_id:
                 return JSONResponse(
-                    status_code=500,
+                    status_code=409,
                     content={
                         "success": False,
-                        "error": "Delete failed",
-                        "message": f"Failed to delete server '{server_key_to_delete}': {delete_error}",
-                        "deleted_keys": deleted_keys,
+                        "error": "device_mismatch",
+                        "message": "That tunnel is already linked to another device on this account.",
                     },
                 )
+            if not existing_device:
+                supabase.table("mcp_servers").update(
+                    {
+                        "owner_device_id": owner_device_id,
+                        "updated_at": datetime.now().isoformat(),
+                    }
+                ).eq("id", keeper.get("id")).execute()
 
         return JSONResponse(
             status_code=200,
             content={
                 "success": True,
-                "message": "MCP server selection confirmed",
+                "message": "MCP server linked to this device",
                 "server_key": keeper.get("server_key"),
                 "server_name": keeper.get("name"),
                 "server_id": keeper.get("id"),
-                "deleted_count": len(deleted_keys),
-                "deleted_keys": deleted_keys,
+                "deleted_count": 0,
+                "deleted_keys": [],
             },
         )
     except json.JSONDecodeError:
