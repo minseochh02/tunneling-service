@@ -162,6 +162,17 @@ def _release_active_tunnel(tunnel_id: str, websocket: WebSocket) -> bool:
     return True
 
 
+def _decode_tunnel_response_body(body: str | None, body_encoding: str | None) -> bytes:
+    """Decode desktop client WS response body (UTF-8 string or base64)."""
+    if not body:
+        return b""
+    if (body_encoding or "").lower() == "base64":
+        import base64
+
+        return base64.b64decode(body)
+    return body.encode("utf-8")
+
+
 def _encode_tunnel_request_body(
     raw: bytes,
     content_type: str,
@@ -187,6 +198,10 @@ def _encode_tunnel_request_body(
     is_binaryish = (
         ct.startswith("multipart/")
         or ct.startswith("application/octet-stream")
+        or ct.startswith("image/")
+        or ct.startswith("audio/")
+        or ct.startswith("video/")
+        or ct.startswith("font/")
         or (bool(ct) and not is_textish)
     )
     can_base64 = TUNNEL_BODY_BASE64_ENABLED and "body_base64" in caps
@@ -3294,8 +3309,12 @@ async def _handle_tunnel_request(
                 del response_headers["Content-Length"]
 
             # Return response to original requester
+            response_bytes = _decode_tunnel_response_body(
+                response_data.get("body"),
+                response_data.get("body_encoding"),
+            )
             response = Response(
-                content=response_data.get("body", ""),
+                content=response_bytes,
                 status_code=response_data.get("status_code", 200),
                 headers=response_headers
             )
