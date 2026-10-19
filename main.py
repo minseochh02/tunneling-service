@@ -1934,7 +1934,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         sent = await _ws_send_json(websocket, {
             "type": "connected",
             "tunnel_id": tunnel_id,
-            "public_url": f"https://tunneling-service.onrender.com/t/{tunnel_id}"
+            "public_url": f"https://tunneling-service.onrender.com/t/{tunnel_id}/"
         })
         if not sent:
             print(f"✗ Tunnel {tunnel_id} closed before connected ack")
@@ -2512,6 +2512,19 @@ async def set_tunnel_domain_mapping(tunnel_id: str, request: Request):
     except Exception as e:
         print(f"❌ Failed to update domain mapping in Supabase: {e}")
         return JSONResponse(status_code=500, content={"error": "Failed to persist domain mapping"})
+
+
+@app.api_route(
+    "/t/{tunnel_id}",
+    methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"],
+)
+async def tunnel_request_trailing_slash_redirect(tunnel_id: str, request: Request):
+    """`/t/{id}` without a trailing slash does not match `{path:path}` — redirect to tunnel root."""
+    from fastapi.responses import RedirectResponse
+
+    qs = request.url.query
+    target = f"/t/{tunnel_id}/" + (f"?{qs}" if qs else "")
+    return RedirectResponse(url=target, status_code=308)
 
 
 @app.api_route("/t/{tunnel_id}/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
