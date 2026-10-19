@@ -3299,10 +3299,13 @@ async def _handle_tunnel_request(
             pending_requests.pop(request_id, None)
             pending_request_tunnels.pop(request_id, None)
 
-            # Get headers and remove Content-Length (let FastAPI recalculate it)
-            # This is important because the tunnel client may have injected content (like <base> tags)
-            # which changes the body length
+            # Get headers and remove Content-Length (let FastAPI recalculate it for GET/POST bodies).
+            # For HEAD, keep the origin Content-Length — body is empty but scrapers (Kakao og:image) need it.
             response_headers = response_data.get("headers", {})
+            origin_content_length = (
+                response_headers.get("content-length")
+                or response_headers.get("Content-Length")
+            )
             if "content-length" in response_headers:
                 del response_headers["content-length"]
             if "Content-Length" in response_headers:
@@ -3313,6 +3316,19 @@ async def _handle_tunnel_request(
                 response_data.get("body"),
                 response_data.get("body_encoding"),
             )
+            if request.method.upper() == "HEAD":
+                response_bytes = b""
+                if origin_content_length:
+                    response_headers["content-length"] = str(origin_content_length)
+            elif (
+                response_bytes[:8] != b"\x89PNG\r\n\x1a\n"
+                and "image/png" in (response_headers.get("content-type") or "").lower()
+                and response_data.get("body_encoding") != "base64"
+            ):
+                print(
+                    f"⚠️ [tunnel-req {request_id}] PNG response missing body_encoding=base64 "
+                    f"(tunnel client too old or corrupt). tunnel={tunnel_id} path={full_path}"
+                )
             response = Response(
                 content=response_bytes,
                 status_code=response_data.get("status_code", 200),
