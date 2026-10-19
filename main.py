@@ -162,6 +162,44 @@ def _release_active_tunnel(tunnel_id: str, websocket: WebSocket) -> bool:
     return True
 
 
+_HOP_BY_HOP_RESPONSE = frozenset(
+    {
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailers",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+    }
+)
+
+
+def _sanitize_tunnel_response_headers(
+    headers: dict | None, body_len: int, method: str
+) -> dict:
+    """
+    Desktop client sends a fully buffered body over WS; drop chunked/keep-alive headers
+    and set Content-Length so browsers do not wait for a chunk terminator forever.
+    """
+    src = headers or {}
+    origin_content_length = src.get("content-length") or src.get("Content-Length")
+    out: dict = {}
+    for key, value in src.items():
+        lower = key.lower()
+        if lower in _HOP_BY_HOP_RESPONSE or lower.startswith("proxy-"):
+            continue
+        out[key] = value
+    if method.upper() == "HEAD":
+        if origin_content_length:
+            out["content-length"] = str(origin_content_length)
+    else:
+        out["content-length"] = str(body_len)
+    return out
+
+
 def _decode_tunnel_response_body(body: str | None, body_encoding: str | None) -> bytes:
     """Decode desktop client WS response body (UTF-8 string or base64)."""
     if not body:
@@ -551,8 +589,8 @@ async def resolve_domain_to_tunnel(domain: str) -> str | None:
             custom_domains = desc.get("custom_domains") or []
             normalized_domains = {normalize_host(str(item)) for item in custom_domains}
             if domain in normalized_domains:
-                # Prefer name (slug) over server_key since active_tunnels is keyed by name
-                tunnel_id = row.get("name") or row.get("server_key")
+                # WebSocket /t/{name} uses server_key from registration; prefer server_key.
+                tunnel_id = row.get("server_key") or row.get("name")
                 if tunnel_id:
                     domain_route_cache[domain] = (tunnel_id, time.time())
                     print(f"🌐 Custom domain resolved: {domain} → tunnel_id='{tunnel_id}' (name='{row.get('name')}', server_key='{row.get('server_key')}')")
@@ -3312,28 +3350,19 @@ async def _handle_tunnel_request(
             pending_requests.pop(request_id, None)
             pending_request_tunnels.pop(request_id, None)
 
-            # Get headers and remove Content-Length (let FastAPI recalculate it for GET/POST bodies).
-            # For HEAD, keep the origin Content-Length — body is empty but scrapers (Kakao og:image) need it.
-            response_headers = response_data.get("headers", {})
-            origin_content_length = (
-                response_headers.get("content-length")
-                or response_headers.get("Content-Length")
-            )
-            if "content-length" in response_headers:
-                del response_headers["content-length"]
-            if "Content-Length" in response_headers:
-                del response_headers["Content-Length"]
-
-            # Return response to original requester
             response_bytes = _decode_tunnel_response_body(
                 response_data.get("body"),
                 response_data.get("body_encoding"),
             )
             if request.method.upper() == "HEAD":
                 response_bytes = b""
-                if origin_content_length:
-                    response_headers["content-length"] = str(origin_content_length)
-            elif (
+
+            response_headers = _sanitize_tunnel_response_headers(
+                response_data.get("headers", {}),
+                len(response_bytes),
+                request.method,
+            )
+            if (
                 response_bytes[:8] != b"\x89PNG\r\n\x1a\n"
                 and "image/png" in (response_headers.get("content-type") or "").lower()
                 and response_data.get("body_encoding") != "base64"
