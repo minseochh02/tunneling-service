@@ -382,6 +382,42 @@ def parse_description_json(raw_description) -> dict:
         return {}
 
 
+def _is_generic_register_description(value) -> bool:
+    if value is None or value == "":
+        return True
+    if not isinstance(value, str):
+        return False
+    return value.strip().lower().startswith("mcp server:")
+
+
+def _has_rich_description_metadata(desc: dict) -> bool:
+    for key in (
+        "custom_domains",
+        "domain_project_map",
+        "domain_device_map",
+        "api_key",
+        "project_access",
+        "public_access",
+    ):
+        val = desc.get(key)
+        if val is None:
+            continue
+        if isinstance(val, (list, dict)) and len(val) == 0:
+            continue
+        return True
+    return False
+
+
+def resolve_description_for_update(existing_raw, incoming):
+    """Return description for UPDATE, or None to omit field (preserve custom_domains JSON)."""
+    existing = parse_description_json(existing_raw)
+    if _has_rich_description_metadata(existing) and _is_generic_register_description(incoming):
+        return None
+    if incoming is None or incoming == "":
+        return None
+    return incoming
+
+
 def extract_project_from_path(path: str) -> str | None:
     """Extract project name from a /p/{project_name}/... path."""
     if path.startswith("p/"):
@@ -1072,14 +1108,19 @@ async def register_mcp(request: Request):
                     )
 
                 # Owner verified - update the record
+                resolved_description = resolve_description_for_update(
+                    existing_record.get("description"),
+                    description,
+                )
                 update_data = {
                     "name": name,
-                    "description": description,
                     "connection_url": connection_url,
                     "max_concurrent_connections": max_concurrent_connections,
                     "updated_at": datetime.now().isoformat(),
                     "status": "active"
                 }
+                if resolved_description is not None:
+                    update_data["description"] = resolved_description
                 if owner_device_id:
                     update_data["owner_device_id"] = owner_device_id
                 
