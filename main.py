@@ -99,6 +99,10 @@ pending_requests = {}  # {request_id: asyncio.Future}
 pending_request_tunnels: dict[str, str] = {}  # request_id -> tunnel_id
 streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 
+# Throttle rapid retryable WebSocket connect attempts (legacy clients ignore code fields).
+_tunnel_ws_retry_gate: dict[str, float] = {}
+_TUNNEL_WS_MIN_RETRY_INTERVAL_SEC = float(os.getenv("TUNNEL_WS_MIN_RETRY_INTERVAL_SEC", "2"))
+
 
 def fail_pending_requests_for_tunnel(tunnel_id: str, reason: str = "tunnel_disconnect") -> int:
     """
@@ -954,6 +958,38 @@ async def root(request: Request):
         },
     }
 
+@app.get("/custom-domains/route-status")
+async def custom_domain_route_status(request: Request, host: str = None):
+    """Resolve custom domain → tunnel_id and whether that tunnel is live on this gateway."""
+    normalized = normalize_host(str(host or "").strip())
+    if not normalized or normalized in PRIMARY_DOMAINS:
+        return JSONResponse(status_code=400, content={"error": "valid host query param required"})
+
+    user_id, _user_email = get_user_from_auth_header(request)
+    if not user_id:
+        return JSONResponse(status_code=401, content={"error": "Authentication required"})
+
+    tunnel_id = await resolve_domain_to_tunnel(normalized)
+    live = bool(tunnel_id and tunnel_id in active_tunnels)
+    return {
+        "host": normalized,
+        "tunnel_id": tunnel_id,
+        "live_on_gateway": live,
+    }
+
+
+def _verify_row_owner_device(
+    server_data: dict,
+    device_id: str | None,
+) -> tuple[bool, str | None]:
+    """Reject cross-device writes when mcp_servers.owner_device_id is set."""
+    row_device = (server_data.get("owner_device_id") or "").strip()
+    connect_device = (device_id or "").strip()
+    if row_device and connect_device and row_device != connect_device:
+        return False, "This tunnel id is registered to another device on your account."
+    return True, None
+
+
 @app.post("/custom-domains/register")
 async def register_custom_domains(request: Request):
     """Register custom domains for a tunnel and ask Render to provision SSL."""
@@ -981,6 +1017,11 @@ async def register_custom_domains(request: Request):
         is_owner, ownership_error = verify_ownership(request, server_data)
         if not is_owner:
             return JSONResponse(status_code=403, content={"error": ownership_error or "Forbidden"})
+
+        body_device = str(body.get("device_id") or body.get("owner_device_id") or "").strip() or None
+        device_ok, device_err = _verify_row_owner_device(server_data, body_device)
+        if not device_ok:
+            return JSONResponse(status_code=403, content={"error": device_err or "Forbidden"})
 
         updated_description = merge_custom_domains_description(server_data.get("description"), domains)
         supabase.table("mcp_servers").update({"description": updated_description}).eq("id", server_data["id"]).execute()
@@ -1803,6 +1844,61 @@ def _is_missing_lease_row(exc: Exception) -> bool:
     )
 
 
+def _tunnel_ws_connect_throttled(tunnel_name: str | None, device_id: str | None) -> bool:
+    key = f"{(tunnel_name or '').strip()}|{(device_id or '').strip()}"
+    if not key or key == "|":
+        return False
+    now = time.time()
+    last = _tunnel_ws_retry_gate.get(key)
+    if last is not None and now - last < _TUNNEL_WS_MIN_RETRY_INTERVAL_SEC:
+        return True
+    _tunnel_ws_retry_gate[key] = now
+    return False
+
+
+def _tunnel_ws_error(message: str, code: str, retryable: bool) -> dict:
+    return {
+        "type": "error",
+        "message": message,
+        "code": code,
+        "retryable": retryable,
+    }
+
+
+def _lease_connect_error(message: str) -> dict:
+    """Map internal lease check failures to client-safe messages (no legacy regex triggers)."""
+    lower = (message or "").lower()
+    if "lookup failed" in lower:
+        return _tunnel_ws_error(
+            "Tunnel provider routing lookup failed.",
+            "lease_lookup_failed",
+            True,
+        )
+    if "retry claim" in lower or "expired for another" in lower:
+        return _tunnel_ws_error(
+            "Tunnel provider assignment expired on another device — reclaim on this device.",
+            "lease_expired_retry_claim",
+            True,
+        )
+    if "held by another" in lower:
+        return _tunnel_ws_error(
+            "Another device is the active tunnel provider for this server.",
+            "lease_held_by_other",
+            False,
+        )
+    if "invalid tunnel provider lease" in lower:
+        return _tunnel_ws_error(
+            "Tunnel provider assignment is invalid — reclaim on this device.",
+            "lease_expired_retry_claim",
+            True,
+        )
+    return _tunnel_ws_error(
+        "Tunnel provider assignment was rejected.",
+        "unknown",
+        False,
+    )
+
+
 def _verify_tunnel_provider_lease(
     owner_user_id: str | None,
     tunnel_name: str,
@@ -1870,26 +1966,50 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
     
     # Use server name as tunnel identifier
     if not name:
-        await _ws_send_json(websocket, {
-            "type": "error",
-            "message": "Server name is required as query parameter"
-        })
+        await _ws_send_json(
+            websocket,
+            _tunnel_ws_error(
+                "Server name is required as query parameter",
+                "invalid_args",
+                False,
+            ),
+        )
         await _ws_close(websocket)
         return
     
     # Check if server is registered in mcp_servers table (check by server_key or name)
     # Try server_key first, then fallback to name for backwards compatibility
-    existing = supabase.table("mcp_servers").select("id, name, server_key, status, owner_user_id, description").or_(f"server_key.eq.{name},name.eq.{name}").execute()
+    existing = supabase.table("mcp_servers").select(
+        "id, name, server_key, status, owner_user_id, owner_device_id, description"
+    ).or_(f"server_key.eq.{name},name.eq.{name}").execute()
     
     if not existing.data or len(existing.data) == 0:
-        await _ws_send_json(websocket, {
-            "type": "error",
-            "message": f"Server '{name}' is not registered. Please register first."
-        })
+        await _ws_send_json(
+            websocket,
+            _tunnel_ws_error(
+                f"Server '{name}' is missing from the MCP catalog. Complete registration first.",
+                "not_registered",
+                True,
+            ),
+        )
         await _ws_close(websocket)
         return
     
     server_data = existing.data[0]
+
+    connect_device = (device_id or "").strip()
+    owner_device = (server_data.get("owner_device_id") or "").strip()
+    if owner_device and connect_device and owner_device != connect_device:
+        await _ws_send_json(
+            websocket,
+            _tunnel_ws_error(
+                "This tunnel id is registered to another device on your account.",
+                "device_tunnel_mismatch",
+                False,
+            ),
+        )
+        await _ws_close(websocket)
+        return
 
     lease_ok, lease_error = _verify_tunnel_provider_lease(
         server_data.get("owner_user_id"),
@@ -1897,19 +2017,27 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         device_id,
     )
     if not lease_ok:
-        await _ws_send_json(websocket, {
-            "type": "error",
-            "message": lease_error or "Tunnel provider lease rejected",
-        })
+        payload = _lease_connect_error(lease_error or "Tunnel provider lease rejected")
+        if payload.get("retryable") and _tunnel_ws_connect_throttled(name, device_id):
+            payload = _tunnel_ws_error(
+                "Connection attempts throttled — wait briefly and retry.",
+                str(payload.get("code") or "lease_lookup_failed"),
+                True,
+            )
+        await _ws_send_json(websocket, payload)
         await _ws_close(websocket)
         return
     
     # Check if server is active
     if server_data.get("status") != "active":
-        await _ws_send_json(websocket, {
-            "type": "error",
-            "message": f"Server '{name}' is not active (status: {server_data.get('status')})"
-        })
+        await _ws_send_json(
+            websocket,
+            _tunnel_ws_error(
+                f"Server '{name}' cannot accept tunnel connections (status: {server_data.get('status')}).",
+                "not_active",
+                False,
+            ),
+        )
         await _ws_close(websocket)
         return
     
@@ -2495,6 +2623,11 @@ async def set_tunnel_domain_mapping(tunnel_id: str, request: Request):
     is_owner, err = verify_ownership(request, server_data)
     if not is_owner:
         return JSONResponse(status_code=403, content={"error": err or "Forbidden"})
+
+    body_device = str(body.get("device_id") or body.get("owner_device_id") or "").strip() or None
+    device_ok, device_err = _verify_row_owner_device(server_data, body_device)
+    if not device_ok:
+        return JSONResponse(status_code=403, content={"error": device_err or "Forbidden"})
 
     try:
         desc_json = parse_description_json(server_data.get("description"))
