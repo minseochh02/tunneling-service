@@ -1954,6 +1954,14 @@ def _verify_tunnel_provider_lease(
         return True, None
 
     if holder != device_id:
+        # DB lease can outlive the holder's WebSocket (gateway restart, crash). Allow
+        # a new device to connect when this tunnel id has no live socket here.
+        if tunnel_name not in active_tunnels:
+            print(
+                f"⚠️  Lease holder '{holder}' has no live socket for '{tunnel_name}' "
+                f"— allowing connect from '{device_id}'"
+            )
+            return True, None
         return False, f"Tunnel '{tunnel_name}' lease held by another device"
 
     return True, None
