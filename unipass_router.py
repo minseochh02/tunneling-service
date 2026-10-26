@@ -1,10 +1,9 @@
 """
-UNI-PASS 화물통관진행정보 test lookup.
+UNI-PASS lookups. Each service has its own crkyCn on this gateway.
 
-Dataset: https://www.data.go.kr/data/15126268/openapi.do
-The call goes to UNI-PASS directly. The auth key (crkyCn) stays on this
-gateway. Prefer UNIPASS_API_KEY; DATA_GO_KR_API_KEY is the fallback already
-set on Render.
+Env names:
+  UNIPASS_CARGO_KEY   화물통관진행정보조회 (API001). UNIPASS_API_KEY still works.
+  UNIPASS_FXRT_KEY    관세환율정보조회 (API012)
 """
 
 from __future__ import annotations
@@ -18,22 +17,21 @@ import httpx
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
-CARGO_URL = (
-    "https://unipass.customs.go.kr:38010/ext/rest/"
-    "cargCsclPrgsInfoQry/retrieveCargCsclPrgsInfo"
-)
-APPLY_URL = "https://www.data.go.kr/data/15126268/openapi.do"
+UNIPASS_BASE = "https://unipass.customs.go.kr:38010/ext/rest/"
+CARGO_URL = UNIPASS_BASE + "cargCsclPrgsInfoQry/retrieveCargCsclPrgsInfo"
+FXRT_URL = UNIPASS_BASE + "trifFxrtInfoQry/retrieveTrifFxrtInfo"
+
+# First name is the one to set on Render. Later names are legacy aliases.
+SERVICE_KEYS = {
+    "cargo": ("UNIPASS_CARGO_KEY", "UNIPASS_API_KEY", "UNIPASS_CRKY_CN"),
+    "fxrt": ("UNIPASS_FXRT_KEY",),
+}
 
 unipass_router = APIRouter(prefix="/unipass", tags=["Unipass"])
 
 
-def _crky() -> tuple[str, str]:
-    for name in (
-        "UNIPASS_API_KEY",
-        "UNIPASS_CRKY_CN",
-        "DATA_GO_KR_API_KEY",
-        "DATA_GO_KR_SERVICE_KEY",
-    ):
+def _service_key(service: str) -> tuple[str, str]:
+    for name in SERVICE_KEYS[service]:
         raw = (os.getenv(name) or "").strip()
         if raw:
             return raw, name
@@ -178,17 +176,13 @@ async def cargo_lookup(
     if not bl_no:
         return JSONResponse(status_code=400, content={"error": "bl is required"})
 
-    key, source = _crky()
+    key, source = _service_key("cargo")
     if not key:
         return JSONResponse(
             status_code=503,
             content={
                 "queryable": False,
-                "error": (
-                    "No UNI-PASS key on tunneling-service. "
-                    "Set UNIPASS_API_KEY (crkyCn from UNI-PASS OpenAPI 사용관리) "
-                    f"or DATA_GO_KR_API_KEY. Apply: {APPLY_URL}"
-                ),
+                "error": "Set UNIPASS_CARGO_KEY on tunneling-service (화물통관진행정보 crkyCn).",
             },
         )
 
@@ -234,10 +228,8 @@ async def cargo_lookup(
             "reason": "auth",
             "keySource": source,
             "message": (
-                "UNI-PASS rejected the key on Render. "
-                "화물통관진행정보 uses crkyCn from UNI-PASS My메뉴 > OpenAPI 사용관리, "
-                "which is separate from the data.go.kr serviceKey used by 국세청/나라장터. "
-                f"Set UNIPASS_API_KEY. Portal: {APPLY_URL}"
+                "UNI-PASS rejected this key. "
+                "Set UNIPASS_CARGO_KEY to the 화물통관진행정보 crkyCn."
             ),
             "attempts": attempts,
         }
@@ -264,4 +256,73 @@ async def cargo_lookup(
         "details": match.get("details") or [],
         "detailEmpty": match.get("detailEmpty") or [],
         "attempts": attempts,
+    }
+
+
+@unipass_router.get("/fxrt")
+async def exchange_rate(
+    date: str = Query(..., description="조회년월일 YYYYMMDD"),
+    imex: str = Query("2", description="1 수출, 2 수입"),
+    curr: str | None = Query(None, description="통화부호. 예: USD. 생략하면 전체"),
+):
+    """관세환율정보조회 (API012). Uses UNIPASS_FXRT_KEY."""
+    qry = "".join(ch for ch in date if ch.isdigit())
+    if len(qry) != 8:
+        return JSONResponse(status_code=400, content={"error": "date must be YYYYMMDD"})
+    if imex not in {"1", "2"}:
+        return JSONResponse(status_code=400, content={"error": "imex must be 1 (export) or 2 (import)"})
+
+    key, source = _service_key("fxrt")
+    if not key:
+        return JSONResponse(
+            status_code=503,
+            content={"error": "Set UNIPASS_FXRT_KEY on tunneling-service (관세환율정보 crkyCn)."},
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=25.0) as client:
+            resp = await client.get(
+                FXRT_URL,
+                params={"crkyCn": key, "qryYymmDd": qry, "imexTp": imex},
+            )
+    except httpx.HTTPError as exc:
+        return JSONResponse(status_code=502, content={"error": f"{type(exc).__name__}: {exc}"})
+
+    body = resp.text or ""
+    if resp.status_code >= 400:
+        return JSONResponse(status_code=502, content={"error": body[:300], "httpStatus": resp.status_code})
+
+    try:
+        parsed = _parse_xml(body)
+        rates, empty = _records(body, "trifFxrtInfoQryVo")
+    except ElementTree.ParseError:
+        return JSONResponse(status_code=502, content={"error": f"XML parse failed: {body[:300]}"})
+
+    notice = parsed.get("ntceInfo") or ""
+    if isinstance(notice, list):
+        notice = " ".join(str(part) for part in notice if part)
+    count = _count(parsed.get("tCnt"))
+    if _auth_failed(str(notice), count):
+        return {
+            "queryable": False,
+            "reason": "auth",
+            "keySource": source,
+            "notice": notice,
+            "message": "Set UNIPASS_FXRT_KEY to the 관세환율정보 crkyCn. It is not the cargo key.",
+        }
+
+    wanted = (curr or "").strip().upper()
+    if wanted:
+        rates = [row for row in rates if str(row.get("currSgn") or "").upper() == wanted]
+
+    print(f"💱 UNI-PASS fxrt {qry} imex={imex} curr={wanted or '*'} count={count}")
+    return {
+        "queryable": bool(rates),
+        "keySource": source,
+        "date": qry,
+        "imex": imex,
+        "count": count,
+        "notice": notice,
+        "rates": rates,
+        "empty": empty,
     }

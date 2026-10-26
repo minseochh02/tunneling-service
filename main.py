@@ -960,6 +960,11 @@ async def root(request: Request):
         },
         "unipass": {
             "cargo": "/unipass/cargo?bl={blNo}",
+            "fxrt": "/unipass/fxrt?date=YYYYMMDD&imex=2&curr=USD",
+            "keys": {
+                "cargo": "UNIPASS_CARGO_KEY",
+                "fxrt": "UNIPASS_FXRT_KEY",
+            },
         },
     }
 
