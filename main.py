@@ -27,6 +27,7 @@ from bizverify_router import bizverify_router, handle_bizverify_http
 from nps_router import nps_router, handle_nps_http
 from koneps_router import koneps_router, handle_koneps_http
 from bidnotice_router import bidnotice_router, handle_bidnotice_http
+from unipass_router import unipass_router
 from visitor_auth_router import handle_visitor_auth_http
 from visitor_auth_byo_gateway import (
     log_visitor_callback_path_only,
@@ -74,6 +75,7 @@ app.include_router(bizverify_router)
 app.include_router(nps_router)
 app.include_router(koneps_router)
 app.include_router(bidnotice_router)
+app.include_router(unipass_router)
 
 # Configure CORS
 app.add_middleware(
@@ -955,6 +957,9 @@ async def root(request: Request):
             "tools": "/bidnotice/tools",
             "call": "/bidnotice/tools/call",
             "tunnel": "/t/{tunnelId}/bidnotice/tools/call",
+        },
+        "unipass": {
+            "cargo": "/unipass/cargo?bl={blNo}",
         },
     }
 
