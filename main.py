@@ -28,6 +28,7 @@ from nps_router import nps_router, handle_nps_http
 from koneps_router import koneps_router, handle_koneps_http
 from bidnotice_router import bidnotice_router, handle_bidnotice_http
 from unipass_router import unipass_router
+from fedex_router import fedex_router
 from visitor_auth_router import handle_visitor_auth_http
 from visitor_auth_byo_gateway import (
     log_visitor_callback_path_only,
@@ -76,6 +77,7 @@ app.include_router(nps_router)
 app.include_router(koneps_router)
 app.include_router(bidnotice_router)
 app.include_router(unipass_router)
+app.include_router(fedex_router)
 
 # Configure CORS
 app.add_middleware(
@@ -970,6 +972,16 @@ async def root(request: Request):
                 "imp_pay_path": "UNIPASS_IMP_PAY_PATH (optional, default API049 taxMgPayYnAndPayDtInfoQry/retrieveTaxMgPayYnAndPayDt)",
                 "imp_rlse": "UNIPASS_IMP_RLSE_KEY",
                 "imp_rlse_path": "UNIPASS_IMP_RLSE_PATH (optional, default API048 impCmdtSnarRlseDclrQry/retrieveImpCmdtSnarRlseDclr)",
+            },
+        },
+        "fedex": {
+            "track": "/fedex/track?trackingNumber={no}",
+            "keys": {
+                "client_id": "FEDEX_CLIENT_ID",
+                "client_secret": "FEDEX_CLIENT_SECRET",
+                "api_base": "FEDEX_API_BASE_URL (optional)",
+                "production": "FEDEX_USE_PRODUCTION=true for apis.fedex.com (else sandbox)",
+                "locale": "FEDEX_LOCALE (optional, default en_US)",
             },
         },
     }
