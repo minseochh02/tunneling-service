@@ -4,8 +4,8 @@ UNI-PASS lookups. Each service has its own crkyCn on this gateway.
 Env names:
   UNIPASS_CARGO_KEY   화물통관진행정보조회 (API001). UNIPASS_API_KEY still works.
   UNIPASS_FXRT_KEY    관세환율정보조회 (API012)
-  UNIPASS_IMP_PAY_KEY 수입 제세 납부여부 및 납부일자
-  UNIPASS_IMP_PAY_PATH optional path after /ext/rest/ (see OpenAPI 연계가이드 API043)
+  UNIPASS_IMP_PAY_KEY 수입 제세 납부여부 및 납부일자 (API049)
+  UNIPASS_IMP_PAY_PATH optional path after /ext/rest/ (default: API049 retrieveTaxMgPayYnAndPayDt)
 """
 
 from __future__ import annotations
@@ -25,7 +25,7 @@ UNIPASS_BASE = (os.getenv("UNIPASS_BASE_URL") or _DEFAULT_UNIPASS_BASE).strip()
 if not UNIPASS_BASE.endswith("/"):
     UNIPASS_BASE += "/"
 
-_DEFAULT_IMP_PAY_PATH = "impPayYnDtQry/retrieveImpPayYnDt"
+_DEFAULT_IMP_PAY_PATH = "taxMgPayYnAndPayDtInfoQry/retrieveTaxMgPayYnAndPayDt"
 
 
 def _rest_url(path: str) -> str:
@@ -49,7 +49,8 @@ SERVICE_KEYS = {
     "imp_pay": ("UNIPASS_IMP_PAY_KEY",),
 }
 
-IMP_PAY_MARKERS = ("payYn", "pymnYn", "impPayYn", "payDt", "pymnDt", "rcptDt", "impDclrNo")
+# API049 response VO: taxMgPayYnAndPayDtInfoQryRsltVo (fpayYn, fpayDt)
+IMP_PAY_MARKERS = ("fpayYn", "fpayDt", "payYn", "pymnYn", "impPayYn", "payDt", "pymnDt", "rcptDt")
 
 unipass_router = APIRouter(prefix="/unipass", tags=["Unipass"])
 
@@ -459,9 +460,8 @@ async def import_tax_payment(
                 "httpStatus": status,
                 "unipassPath": imp_pay_url.replace(UNIPASS_BASE, "").split("?")[0],
                 "hint": (
-                    "Copy the sample URI from OpenAPI 연계가이드 (API043 수입 제세 납부여부·납부일자) "
-                    "or UNI-PASS My > OpenAPI 사용관리 > 상세, then set UNIPASS_IMP_PAY_PATH on Render "
-                    "(path only, e.g. someQry/retrieveSome)."
+                    "Default is API049 taxMgPayYnAndPayDtInfoQry/retrieveTaxMgPayYnAndPayDt. "
+                    "If your guide differs, set UNIPASS_IMP_PAY_PATH on Render (path only, after /ext/rest/)."
                 ),
             },
         )
@@ -492,14 +492,21 @@ async def import_tax_payment(
             "message": "Set UNIPASS_IMP_PAY_KEY to the 수입 제세 납부여부 crkyCn.",
         }
 
-    print(f"💰 UNI-PASS imp-pay {dclr} count={count} records={len(records)}")
+    first = records[0] if records else {}
+    fpay_yn = (first.get("fpayYn") or first.get("payYn") or "").strip()
+    fpay_dt = (first.get("fpayDt") or first.get("payDt") or "").strip()
+
+    print(f"💰 UNI-PASS imp-pay {dclr} fpayYn={fpay_yn or '?'} fpayDt={fpay_dt or '?'} count={count}")
     return {
         "queryable": bool(records) or count not in (None, 0, -1),
+        "serviceId": "API049",
         "impDclrNo": dclr,
         "resolvedFrom": resolved_from,
         "keySource": source,
         "count": count,
         "notice": notice,
+        "fpayYn": fpay_yn or None,
+        "fpayDt": fpay_dt or None,
         "records": records,
         "parsed": {k: v for k, v in parsed.items() if k not in {"ntceInfo", "tCnt"}},
     }

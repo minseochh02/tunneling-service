@@ -966,7 +966,7 @@ async def root(request: Request):
                 "cargo": "UNIPASS_CARGO_KEY",
                 "fxrt": "UNIPASS_FXRT_KEY",
                 "imp_pay": "UNIPASS_IMP_PAY_KEY",
-                "imp_pay_path": "UNIPASS_IMP_PAY_PATH (optional, default impPayYnDtQry/retrieveImpPayYnDt)",
+                "imp_pay_path": "UNIPASS_IMP_PAY_PATH (optional, default API049 taxMgPayYnAndPayDtInfoQry/retrieveTaxMgPayYnAndPayDt)",
             },
         },
     }
