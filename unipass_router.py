@@ -6,6 +6,8 @@ Env names:
   UNIPASS_FXRT_KEY    관세환율정보조회 (API012)
   UNIPASS_IMP_PAY_KEY 수입 제세 납부여부 및 납부일자 (API049)
   UNIPASS_IMP_PAY_PATH optional path after /ext/rest/ (default: API049 retrieveTaxMgPayYnAndPayDt)
+  UNIPASS_IMP_RLSE_KEY 수입물품 보세구역 반출신고 정보 (API048)
+  UNIPASS_IMP_RLSE_PATH optional path after /ext/rest/ (default: API048 retrieveImpCmdtSnarRlseDclr)
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ if not UNIPASS_BASE.endswith("/"):
     UNIPASS_BASE += "/"
 
 _DEFAULT_IMP_PAY_PATH = "taxMgPayYnAndPayDtInfoQry/retrieveTaxMgPayYnAndPayDt"
+_DEFAULT_IMP_RLSE_PATH = "impCmdtSnarRlseDclrQry/retrieveImpCmdtSnarRlseDclr"
 
 
 def _rest_url(path: str) -> str:
@@ -38,19 +41,32 @@ def _imp_pay_url() -> str:
     return _rest_url(path)
 
 
+def _imp_rlse_url() -> str:
+    path = (os.getenv("UNIPASS_IMP_RLSE_PATH") or _DEFAULT_IMP_RLSE_PATH).strip().lstrip("/")
+    return _rest_url(path)
+
+
 CARGO_URL = _rest_url("cargCsclPrgsInfoQry/retrieveCargCsclPrgsInfo")
 FXRT_URL = _rest_url("trifFxrtInfoQry/retrieveTrifFxrtInfo")
 IMP_PAY_URL = _imp_pay_url()
+IMP_RLSE_URL = _imp_rlse_url()
 
 # First name is the one to set on Render. Later names are legacy aliases.
 SERVICE_KEYS = {
     "cargo": ("UNIPASS_CARGO_KEY", "UNIPASS_API_KEY", "UNIPASS_CRKY_CN"),
     "fxrt": ("UNIPASS_FXRT_KEY",),
     "imp_pay": ("UNIPASS_IMP_PAY_KEY",),
+    "imp_rlse": ("UNIPASS_IMP_RLSE_KEY",),
 }
 
 # API049 response VO: taxMgPayYnAndPayDtInfoQryRsltVo (fpayYn, fpayDt)
 IMP_PAY_MARKERS = ("fpayYn", "fpayDt", "payYn", "pymnYn", "impPayYn", "payDt", "pymnDt", "rcptDt")
+# API048 response VO: impCmdtSnarRlseDclrYnRsltVo (rlbrYn, rlbrDt)
+IMP_RLSE_MARKERS = ("rlbrYn", "rlbrDYn", "rlbrDt")
+IMP_RLSE_RECORD_TAGS = (
+    "impCmdtSnarRlseDclrYnRsltVo",
+    "impCmdtSnarRlseDclrQryRsltVo",
+)
 
 unipass_router = APIRouter(prefix="/unipass", tags=["Unipass"])
 
@@ -159,6 +175,68 @@ def _imp_pay_records(text: str) -> list[dict[str, str]]:
             keys_seen.add(sig)
             seen.append(row)
     return seen
+
+
+def _imp_rlse_records(text: str) -> list[dict[str, str]]:
+    seen: list[dict[str, str]] = []
+    keys_seen: set[tuple[tuple[str, str], ...]] = set()
+    for tag in IMP_RLSE_RECORD_TAGS:
+        rows, _ = _records(text, tag)
+        for row in rows:
+            sig = tuple(sorted(row.items()))
+            if sig in keys_seen:
+                continue
+            keys_seen.add(sig)
+            seen.append(row)
+    for marker in IMP_RLSE_MARKERS:
+        for row in _rows_with_field(text, marker):
+            sig = tuple(sorted(row.items()))
+            if sig in keys_seen:
+                continue
+            keys_seen.add(sig)
+            seen.append(row)
+    return seen
+
+
+async def _resolve_imp_dclr_no(
+    impDclrNo: str | None,
+    bl: str | None,
+    year: str | None,
+) -> tuple[str, str | None, JSONResponse | None]:
+    """Return (declaration no, resolved_from, error_response)."""
+    dclr = _normalize_imp_dclr_no(impDclrNo or "")
+    resolved_from: str | None = None
+    if dclr:
+        return dclr, resolved_from, None
+
+    if not bl:
+        return "", None, JSONResponse(
+            status_code=400,
+            content={"error": "impDclrNo is required (or pass bl= with a resolvable import declaration)."},
+        )
+
+    bl_no = "".join(bl.split())
+    cargo_key, _ = _service_key("cargo")
+    if not cargo_key:
+        return "", None, JSONResponse(
+            status_code=503,
+            content={"error": "Set UNIPASS_CARGO_KEY to resolve impDclrNo from B/L."},
+        )
+    cargo = await _query("hbl", bl_no, (year or str(datetime.now().year)), cargo_key)
+    if cargo.get("authFailed"):
+        return "", None, JSONResponse(
+            status_code=502,
+            content={"error": "Cargo key rejected while resolving B/L."},
+        )
+    dclr = _imp_dclr_from_cargo_details(cargo.get("details") or []) or ""
+    if dclr:
+        resolved_from = "cargo"
+    if not dclr:
+        return "", None, JSONResponse(
+            status_code=400,
+            content={"error": "impDclrNo is required (or pass bl= with a resolvable import declaration)."},
+        )
+    return dclr, resolved_from, None
 
 
 def _count(raw: Any) -> int | None:
@@ -413,29 +491,9 @@ async def import_tax_payment(
     year: str | None = Query(None, description="B/L 연도 YYYY"),
 ):
     """수입 제세 납부여부 및 납부일자. Uses UNIPASS_IMP_PAY_KEY."""
-    dclr = _normalize_imp_dclr_no(impDclrNo or "")
-    resolved_from: str | None = None
-
-    if not dclr and bl:
-        bl_no = "".join(bl.split())
-        cargo_key, _ = _service_key("cargo")
-        if not cargo_key:
-            return JSONResponse(
-                status_code=503,
-                content={"error": "Set UNIPASS_CARGO_KEY to resolve impDclrNo from B/L."},
-            )
-        cargo = await _query("hbl", bl_no, (year or str(datetime.now().year)), cargo_key)
-        if cargo.get("authFailed"):
-            return JSONResponse(status_code=502, content={"error": "Cargo key rejected while resolving B/L."})
-        dclr = _imp_dclr_from_cargo_details(cargo.get("details") or []) or ""
-        if dclr:
-            resolved_from = "cargo"
-
-    if not dclr:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "impDclrNo is required (or pass bl= with a resolvable import declaration)."},
-        )
+    dclr, resolved_from, err = await _resolve_imp_dclr_no(impDclrNo, bl, year)
+    if err is not None:
+        return err
 
     key, source = _service_key("imp_pay")
     if not key:
@@ -507,6 +565,98 @@ async def import_tax_payment(
         "notice": notice,
         "fpayYn": fpay_yn or None,
         "fpayDt": fpay_dt or None,
+        "records": records,
+        "parsed": {k: v for k, v in parsed.items() if k not in {"ntceInfo", "tCnt"}},
+    }
+
+
+@unipass_router.get("/imp-rlse")
+async def import_bonded_area_release(
+    impDclrNo: str | None = Query(None, description="수입신고번호 (반출입근거번호 rlbrBssNo)"),
+    bl: str | None = Query(None, description="House B/L — cargo에서 신고번호 추출"),
+    year: str | None = Query(None, description="B/L 연도 YYYY"),
+):
+    """수입물품 보세구역 반출신고 정보 (API048). Uses UNIPASS_IMP_RLSE_KEY."""
+    dclr, resolved_from, err = await _resolve_imp_dclr_no(impDclrNo, bl, year)
+    if err is not None:
+        return err
+
+    key, source = _service_key("imp_rlse")
+    if not key:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": "Set UNIPASS_IMP_RLSE_KEY on tunneling-service (수입물품 보세구역 반출신고 crkyCn).",
+            },
+        )
+
+    imp_rlse_url = _imp_rlse_url()
+    try:
+        status, body = await _unipass_get(imp_rlse_url, {"crkyCn": key, "rlbrBssNo": dclr})
+    except httpx.HTTPError as exc:
+        return JSONResponse(status_code=502, content={"error": f"{type(exc).__name__}: {exc}"})
+
+    if status == 404:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "UNI-PASS returned HTTP 404 for the imp-rlse REST path.",
+                "httpStatus": status,
+                "unipassPath": imp_rlse_url.replace(UNIPASS_BASE, "").split("?")[0],
+                "hint": (
+                    "Default is API048 impCmdtSnarRlseDclrQry/retrieveImpCmdtSnarRlseDclr. "
+                    "If your guide differs, set UNIPASS_IMP_RLSE_PATH on Render."
+                ),
+            },
+        )
+
+    if status >= 400:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": body[:300],
+                "httpStatus": status,
+                "unipassPath": imp_rlse_url.replace(UNIPASS_BASE, "").split("?")[0],
+            },
+        )
+
+    try:
+        parsed = _parse_xml(body)
+        records = _imp_rlse_records(body)
+    except ElementTree.ParseError:
+        return JSONResponse(status_code=502, content={"error": f"XML parse failed: {body[:300]}"})
+
+    notice = parsed.get("ntceInfo") or ""
+    if isinstance(notice, list):
+        notice = " ".join(str(part) for part in notice if part)
+    count = _count(parsed.get("tCnt"))
+    if _auth_failed(str(notice), count):
+        return {
+            "queryable": False,
+            "reason": "auth",
+            "impDclrNo": dclr,
+            "rlbrBssNo": dclr,
+            "keySource": source,
+            "notice": notice,
+            "message": "Set UNIPASS_IMP_RLSE_KEY to the 수입물품 보세구역 반출신고 crkyCn.",
+        }
+
+    first = records[0] if records else {}
+    rlbr_yn = (first.get("rlbrYn") or first.get("rlbrDYn") or "").strip()
+    rlbr_dt = (first.get("rlbrDt") or "").strip()
+
+    print(f"📦 UNI-PASS imp-rlse {dclr} rlbrYn={rlbr_yn or '?'} rlbrDt={rlbr_dt or '?'} count={count}")
+    return {
+        "queryable": bool(records) or count not in (None, 0, -1),
+        "serviceId": "API048",
+        "impDclrNo": dclr,
+        "rlbrBssNo": dclr,
+        "resolvedFrom": resolved_from,
+        "keySource": source,
+        "count": count,
+        "notice": notice,
+        "rlbrYn": rlbr_yn or None,
+        "rlbrDt": rlbr_dt or None,
         "records": records,
         "parsed": {k: v for k, v in parsed.items() if k not in {"ntceInfo", "tCnt"}},
     }

@@ -962,11 +962,14 @@ async def root(request: Request):
             "cargo": "/unipass/cargo?bl={blNo}",
             "fxrt": "/unipass/fxrt?date=YYYYMMDD&imex=2&curr=USD",
             "imp_pay": "/unipass/imp-pay?impDclrNo={no}",
+            "imp_rlse": "/unipass/imp-rlse?impDclrNo={no}",
             "keys": {
                 "cargo": "UNIPASS_CARGO_KEY",
                 "fxrt": "UNIPASS_FXRT_KEY",
                 "imp_pay": "UNIPASS_IMP_PAY_KEY",
                 "imp_pay_path": "UNIPASS_IMP_PAY_PATH (optional, default API049 taxMgPayYnAndPayDtInfoQry/retrieveTaxMgPayYnAndPayDt)",
+                "imp_rlse": "UNIPASS_IMP_RLSE_KEY",
+                "imp_rlse_path": "UNIPASS_IMP_RLSE_PATH (optional, default API048 impCmdtSnarRlseDclrQry/retrieveImpCmdtSnarRlseDclr)",
             },
         },
     }
