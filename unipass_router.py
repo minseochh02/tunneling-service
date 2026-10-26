@@ -5,6 +5,7 @@ Env names:
   UNIPASS_CARGO_KEY   화물통관진행정보조회 (API001). UNIPASS_API_KEY still works.
   UNIPASS_FXRT_KEY    관세환율정보조회 (API012)
   UNIPASS_IMP_PAY_KEY 수입 제세 납부여부 및 납부일자
+  UNIPASS_IMP_PAY_PATH optional path after /ext/rest/ (see OpenAPI 연계가이드 API043)
 """
 
 from __future__ import annotations
@@ -19,10 +20,27 @@ import httpx
 from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 
-UNIPASS_BASE = "https://unipass.customs.go.kr:38010/ext/rest/"
-CARGO_URL = UNIPASS_BASE + "cargCsclPrgsInfoQry/retrieveCargCsclPrgsInfo"
-FXRT_URL = UNIPASS_BASE + "trifFxrtInfoQry/retrieveTrifFxrtInfo"
-IMP_PAY_URL = UNIPASS_BASE + "impPayYnDtQry/retrieveImpPayYnDt"
+_DEFAULT_UNIPASS_BASE = "https://unipass.customs.go.kr:38010/ext/rest/"
+UNIPASS_BASE = (os.getenv("UNIPASS_BASE_URL") or _DEFAULT_UNIPASS_BASE).strip()
+if not UNIPASS_BASE.endswith("/"):
+    UNIPASS_BASE += "/"
+
+_DEFAULT_IMP_PAY_PATH = "impPayYnDtQry/retrieveImpPayYnDt"
+
+
+def _rest_url(path: str) -> str:
+    path = path.strip().lstrip("/")
+    return UNIPASS_BASE + path
+
+
+def _imp_pay_url() -> str:
+    path = (os.getenv("UNIPASS_IMP_PAY_PATH") or _DEFAULT_IMP_PAY_PATH).strip().lstrip("/")
+    return _rest_url(path)
+
+
+CARGO_URL = _rest_url("cargCsclPrgsInfoQry/retrieveCargCsclPrgsInfo")
+FXRT_URL = _rest_url("trifFxrtInfoQry/retrieveTrifFxrtInfo")
+IMP_PAY_URL = _imp_pay_url()
 
 # First name is the one to set on Render. Later names are legacy aliases.
 SERVICE_KEYS = {
@@ -109,13 +127,18 @@ def _normalize_imp_dclr_no(raw: str) -> str:
     return re.sub(r"[^0-9A-Za-z]", "", str(raw or ""))
 
 
+def _looks_like_imp_dclr_no(value: str) -> bool:
+    return bool(re.fullmatch(r"\d{13}M", value))
+
+
 def _imp_dclr_from_cargo_details(details: list[dict[str, str]]) -> str | None:
+    candidates: list[str] = []
     for row in details:
         for key in ("dclrNo", "rlbrBssNo"):
             value = _normalize_imp_dclr_no(row.get(key) or "")
-            if len(value) >= 13 and value.endswith("M"):
-                return value
-    return None
+            if _looks_like_imp_dclr_no(value):
+                candidates.append(value)
+    return candidates[0] if candidates else None
 
 
 async def _unipass_get(url: str, params: dict[str, str]) -> tuple[int, str]:
@@ -422,13 +445,32 @@ async def import_tax_payment(
             },
         )
 
+    imp_pay_url = _imp_pay_url()
     try:
-        status, body = await _unipass_get(IMP_PAY_URL, {"crkyCn": key, "impDclrNo": dclr})
+        status, body = await _unipass_get(imp_pay_url, {"crkyCn": key, "impDclrNo": dclr})
     except httpx.HTTPError as exc:
         return JSONResponse(status_code=502, content={"error": f"{type(exc).__name__}: {exc}"})
 
+    if status == 404:
+        return JSONResponse(
+            status_code=502,
+            content={
+                "error": "UNI-PASS returned HTTP 404 for the imp-pay REST path.",
+                "httpStatus": status,
+                "unipassPath": imp_pay_url.replace(UNIPASS_BASE, "").split("?")[0],
+                "hint": (
+                    "Copy the sample URI from OpenAPI 연계가이드 (API043 수입 제세 납부여부·납부일자) "
+                    "or UNI-PASS My > OpenAPI 사용관리 > 상세, then set UNIPASS_IMP_PAY_PATH on Render "
+                    "(path only, e.g. someQry/retrieveSome)."
+                ),
+            },
+        )
+
     if status >= 400:
-        return JSONResponse(status_code=502, content={"error": body[:300], "httpStatus": status})
+        return JSONResponse(
+            status_code=502,
+            content={"error": body[:300], "httpStatus": status, "unipassPath": imp_pay_url.replace(UNIPASS_BASE, "").split("?")[0]},
+        )
 
     try:
         parsed = _parse_xml(body)
