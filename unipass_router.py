@@ -77,6 +77,21 @@ def _records(text: str, tag: str) -> tuple[list[dict[str, str]], list[str]]:
     return rows, empty
 
 
+def _rows_with_field(text: str, field: str) -> list[dict[str, str]]:
+    """Collect elements that carry `field` (UNI-PASS VO tag names vary by API)."""
+    root = ElementTree.fromstring(text)
+    rows: list[dict[str, str]] = []
+    for elem in root.iter():
+        row = {
+            _local(node.tag): (node.text or "").strip()
+            for node in list(elem)
+            if (node.text or "").strip()
+        }
+        if field in row:
+            rows.append(row)
+    return rows
+
+
 def _auth_failed(notice: str, count: int | None) -> bool:
     if count == -1:
         return True
@@ -294,7 +309,8 @@ async def exchange_rate(
 
     try:
         parsed = _parse_xml(body)
-        rates, empty = _records(body, "trifFxrtInfoQryVo")
+        rates = _rows_with_field(body, "currSgn")
+        empty: list[str] = []
     except ElementTree.ParseError:
         return JSONResponse(status_code=502, content={"error": f"XML parse failed: {body[:300]}"})
 
