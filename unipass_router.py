@@ -24,45 +24,6 @@ CARGO_URL = (
 )
 APPLY_URL = "https://www.data.go.kr/data/15126268/openapi.do"
 
-CARGO_FIELDS = (
-    "csclPrgsStts",
-    "prgsStts",
-    "prgsStCd",
-    "cargMtNo",
-    "mblNo",
-    "hblNo",
-    "blPtNm",
-    "etprDt",
-    "etprCstm",
-    "dsprNm",
-    "ldprNm",
-    "shipNm",
-    "shipNatNm",
-    "shcoFlco",
-    "pckGcnt",
-    "pckUt",
-    "ttwg",
-    "wghtUt",
-    "prnm",
-    "cntrNo",
-    "cntrGcnt",
-    "cargTp",
-    "frwrSgn",
-)
-
-DETAIL_FIELDS = (
-    "cargTrcnRelaBsopTpcd",
-    "prcsDttm",
-    "shedNm",
-    "rlbrCn",
-    "rlbrDttm",
-    "dclrNo",
-    "wght",
-    "wghtUt",
-    "pckGcnt",
-    "pckUt",
-)
-
 unipass_router = APIRouter(prefix="/unipass", tags=["Unipass"])
 
 
@@ -97,24 +58,25 @@ def _parse_xml(text: str) -> dict[str, Any]:
     return out
 
 
-def _children(text: str, tag: str) -> list[dict[str, str]]:
+def _records(text: str, tag: str) -> tuple[list[dict[str, str]], list[str]]:
+    """Return every direct child. Empty tags are listed once so we can see the full schema."""
     root = ElementTree.fromstring(text)
     rows: list[dict[str, str]] = []
+    empty: list[str] = []
     for child in root.iter():
         if _local(child.tag) != tag:
             continue
-        row = {
-            _local(node.tag): (node.text or "").strip()
-            for node in list(child)
-            if (node.text or "").strip()
-        }
+        row: dict[str, str] = {}
+        for node in list(child):
+            name = _local(node.tag)
+            value = (node.text or "").strip()
+            if value:
+                row[name] = value
+            elif name not in empty:
+                empty.append(name)
         if row:
             rows.append(row)
-    return rows
-
-
-def _pick(row: dict[str, str], fields: tuple[str, ...]) -> dict[str, str]:
-    return {key: row[key] for key in fields if row.get(key)}
+    return rows, empty
 
 
 def _auth_failed(notice: str, count: int | None) -> bool:
@@ -170,8 +132,8 @@ async def _query(kind: str, bl: str, year: str, key: str) -> dict[str, Any]:
 
     try:
         parsed = _parse_xml(body)
-        cargos = _children(body, "cargCsclPrgsInfoQryVo")
-        details = _children(body, "cargCsclPrgsInfoDtlQryVo")
+        cargos, cargo_empty = _records(body, "cargCsclPrgsInfoQryVo")
+        details, detail_empty = _records(body, "cargCsclPrgsInfoDtlQryVo")
     except ElementTree.ParseError:
         return {
             "kind": kind,
@@ -191,8 +153,10 @@ async def _query(kind: str, bl: str, year: str, key: str) -> dict[str, Any]:
         "count": count,
         "notice": notice,
         "authFailed": _auth_failed(str(notice), count),
-        "cargos": [_pick(row, CARGO_FIELDS) for row in cargos],
-        "details": [_pick(row, DETAIL_FIELDS) for row in details[:12]],
+        "cargos": cargos,
+        "cargoEmpty": cargo_empty,
+        "details": details,
+        "detailEmpty": detail_empty,
     }
 
 
@@ -296,6 +260,8 @@ async def cargo_lookup(
         "count": match.get("count"),
         "notice": match.get("notice") or "",
         "cargos": match.get("cargos") or [],
+        "cargoEmpty": match.get("cargoEmpty") or [],
         "details": match.get("details") or [],
+        "detailEmpty": match.get("detailEmpty") or [],
         "attempts": attempts,
     }
