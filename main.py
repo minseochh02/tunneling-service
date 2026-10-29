@@ -586,9 +586,16 @@ async def resolve_domain_to_tunnel(domain: str) -> str | None:
             return tunnel_id
         domain_route_cache.pop(domain, None)
 
+    claim_key = fetch_custom_domain_claim_server_key(domain)
+    if claim_key:
+        domain_route_cache[domain] = (claim_key, time.time())
+        print(f"🌐 Custom domain resolved via claim: {domain} → tunnel_id='{claim_key}'")
+        return claim_key
+
+    candidates: list[dict] = []
     try:
         result = supabase.table("mcp_servers") \
-            .select("server_key, name, description") \
+            .select("server_key, name, description, owner_device_id") \
             .ilike("description", f"%{domain}%") \
             .execute()
 
@@ -596,17 +603,61 @@ async def resolve_domain_to_tunnel(domain: str) -> str | None:
             desc = parse_description_json(row.get("description"))
             custom_domains = desc.get("custom_domains") or []
             normalized_domains = {normalize_host(str(item)) for item in custom_domains}
-            if domain in normalized_domains:
-                # WebSocket /t/{name} uses server_key from registration; prefer server_key.
-                tunnel_id = row.get("server_key") or row.get("name")
-                if tunnel_id:
-                    domain_route_cache[domain] = (tunnel_id, time.time())
-                    print(f"🌐 Custom domain resolved: {domain} → tunnel_id='{tunnel_id}' (name='{row.get('name')}', server_key='{row.get('server_key')}')")
-                    return tunnel_id
+            if domain not in normalized_domains:
+                continue
+            tunnel_id = row.get("server_key") or row.get("name")
+            if not tunnel_id:
+                continue
+            updated_at = str(desc.get("custom_domain_updated_at") or "")
+            candidates.append(
+                {
+                    "tunnel_id": tunnel_id,
+                    "owner_device_id": (row.get("owner_device_id") or "").strip(),
+                    "updated_at": updated_at,
+                    "server_key_len": len(str(tunnel_id)),
+                }
+            )
     except Exception as e:
         print(f"❌ Domain lookup failed for {domain}: {e}")
+        return None
 
-    return None
+    if not candidates:
+        return None
+
+    def candidate_score(entry: dict) -> tuple:
+        tid = entry["tunnel_id"]
+        lease_score = 0
+        try:
+            lease = (
+                supabase.table("tunnel_providers")
+                .select("provider_device_id, lease_expires_at")
+                .eq("tunnel_name", tid)
+                .limit(1)
+                .execute()
+            )
+            lease_row = (lease.data or [None])[0]
+            if lease_row:
+                provider = (lease_row.get("provider_device_id") or "").strip()
+                owner = entry.get("owner_device_id") or ""
+                if provider and (provider == owner or provider):
+                    lease_score = 2 if provider == owner else 1
+        except Exception:
+            lease_score = 0
+        return (
+            -lease_score,
+            entry["server_key_len"],
+            entry["updated_at"],
+            tid,
+        )
+
+    candidates.sort(key=candidate_score)
+    tunnel_id = candidates[0]["tunnel_id"]
+    domain_route_cache[domain] = (tunnel_id, time.time())
+    print(
+        f"🌐 Custom domain resolved (legacy): {domain} → tunnel_id='{tunnel_id}' "
+        f"({len(candidates)} candidate(s))"
+    )
+    return tunnel_id
 
 
 def normalize_custom_domains(domains) -> list[str]:
@@ -619,6 +670,81 @@ def normalize_custom_domains(domains) -> list[str]:
         if host not in normalized:
             normalized.append(host)
     return normalized
+
+
+def fetch_custom_domain_claim_server_key(host: str) -> str | None:
+    """Authoritative domain → tunnel mapping when custom_domain_claims is deployed."""
+    normalized = normalize_host(str(host or "").strip())
+    if not normalized:
+        return None
+    try:
+        table_result = (
+            supabase.table("custom_domain_claims")
+            .select("server_key")
+            .eq("host", normalized)
+            .limit(1)
+            .execute()
+        )
+        row = (table_result.data or [None])[0]
+        if row and row.get("server_key"):
+            return str(row["server_key"]).strip()
+    except Exception as exc:
+        message = str(exc)
+        if "custom_domain_claims" not in message and "does not exist" not in message:
+            print(f"⚠️ custom_domain_claims lookup failed for {normalized}: {exc}")
+    try:
+        response = supabase.rpc("custom_domain_claim_owner", {"p_host": normalized}).execute()
+        data = response.data
+        if isinstance(data, str) and data.strip():
+            return data.strip()
+    except Exception as exc:
+        message = str(exc)
+        if "custom_domain_claim_owner" not in message and "PGRST202" not in message:
+            print(f"⚠️ custom_domain_claim_owner lookup failed for {normalized}: {exc}")
+    return None
+
+
+def rpc_add_custom_domain(
+    server_key: str,
+    host: str,
+    device_id: str | None = None,
+    device_label: str | None = None,
+) -> dict:
+    params = {
+        "p_server_key": server_key,
+        "p_host": host,
+    }
+    if device_id:
+        params["p_device_id"] = device_id
+    if device_label:
+        params["p_device_label"] = device_label
+    response = supabase.rpc("add_custom_domain", params).execute()
+    return response.data if isinstance(response.data, dict) else {"success": True}
+
+
+def rpc_remove_custom_domain(server_key: str, host: str) -> dict:
+    response = supabase.rpc(
+        "remove_custom_domain",
+        {"p_server_key": server_key, "p_host": host},
+    ).execute()
+    return response.data if isinstance(response.data, dict) else {"success": True}
+
+
+def rpc_move_custom_domain(host: str, from_key: str, to_key: str) -> dict:
+    response = supabase.rpc(
+        "move_custom_domain",
+        {"p_host": host, "p_from_key": from_key, "p_to_key": to_key},
+    ).execute()
+    return response.data if isinstance(response.data, dict) else {"success": True}
+
+
+def parse_domain_rpc_error(exc: Exception) -> tuple[str | None, str]:
+    message = str(exc)
+    if "custom_domain_claimed:" in message:
+        parts = message.split("custom_domain_claimed:", 1)[-1].split(":")
+        if len(parts) >= 2:
+            return parts[0].strip(), parts[1].strip()
+    return None, message
 
 
 async def add_custom_domain_to_render(domain: str) -> dict:
@@ -976,12 +1102,19 @@ async def root(request: Request):
         },
         "fedex": {
             "track": "/fedex/track?trackingNumber={no}",
+            "ship_validate": "POST /fedex/ship/validate",
+            "ship_rate": "POST /fedex/ship/rate",
+            "ship_batch": "POST /fedex/ship/batch",
+            "label_pdf": "/fedex/labels/{label_id}",
             "keys": {
                 "client_id": "FEDEX_CLIENT_ID",
                 "client_secret": "FEDEX_CLIENT_SECRET",
+                "account_number": "FEDEX_ACCOUNT_NUMBER (required for ship/rate)",
                 "api_base": "FEDEX_API_BASE_URL (optional)",
                 "production": "FEDEX_USE_PRODUCTION=true for apis.fedex.com (else sandbox)",
                 "locale": "FEDEX_LOCALE (optional, default en_US)",
+                "label_dir": "FEDEX_LABEL_DIR (PDF + idempotency storage)",
+                "public_base": "PUBLIC_BASE_URL (label links in batch response)",
             },
         },
     }
@@ -998,10 +1131,12 @@ async def custom_domain_route_status(request: Request, host: str = None):
         return JSONResponse(status_code=401, content={"error": "Authentication required"})
 
     tunnel_id = await resolve_domain_to_tunnel(normalized)
+    claim_server_key = fetch_custom_domain_claim_server_key(normalized)
     live = bool(tunnel_id and tunnel_id in active_tunnels)
     return {
         "host": normalized,
         "tunnel_id": tunnel_id,
+        "claim_server_key": claim_server_key,
         "live_on_gateway": live,
     }
 
@@ -1028,6 +1163,7 @@ async def register_custom_domains(request: Request):
 
     server_key = str(body.get("server_key") or "").strip()
     domains = normalize_custom_domains(body.get("domains") or [])
+    transfer = body.get("transfer") is True
 
     if not server_key:
         return JSONResponse(status_code=400, content={"error": "server_key is required"})
@@ -1051,8 +1187,72 @@ async def register_custom_domains(request: Request):
         if not device_ok:
             return JSONResponse(status_code=403, content={"error": device_err or "Forbidden"})
 
-        updated_description = merge_custom_domains_description(server_data.get("description"), domains)
-        supabase.table("mcp_servers").update({"description": updated_description}).eq("id", server_data["id"]).execute()
+        body_label = str(body.get("device_label") or "").strip() or None
+        domain_results = []
+        for domain in domains:
+            claim_owner = fetch_custom_domain_claim_server_key(domain)
+            if claim_owner and claim_owner != server_key:
+                if not transfer:
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "success": False,
+                            "error": "domain_already_claimed",
+                            "host": domain,
+                            "server_key": server_key,
+                            "claim_server_key": claim_owner,
+                            "message": (
+                                f"Domain '{domain}' is already bound to tunnel '{claim_owner}'. "
+                                "Set transfer=true to move it explicitly."
+                            ),
+                        },
+                    )
+                try:
+                    moved = rpc_move_custom_domain(domain, claim_owner, server_key)
+                    domain_results.append({"host": domain, "moved": True, "from": claim_owner, "result": moved})
+                except Exception as move_error:
+                    host, err_msg = parse_domain_rpc_error(move_error)
+                    return JSONResponse(
+                        status_code=409,
+                        content={
+                            "success": False,
+                            "error": "domain_transfer_failed",
+                            "host": domain,
+                            "message": err_msg,
+                        },
+                    )
+            else:
+                try:
+                    added = rpc_add_custom_domain(
+                        server_key,
+                        domain,
+                        device_id=body_device,
+                        device_label=body_label,
+                    )
+                    domain_results.append({"host": domain, "added": added})
+                except Exception as add_error:
+                    err_text = str(add_error)
+                    if "PGRST202" in err_text or "add_custom_domain" in err_text and "Could not find" in err_text:
+                        updated_description = merge_custom_domains_description(
+                            server_data.get("description"),
+                            [domain],
+                        )
+                        supabase.table("mcp_servers").update(
+                            {"description": updated_description}
+                        ).eq("id", server_data["id"]).execute()
+                        domain_results.append({"host": domain, "legacy_merge": True})
+                        continue
+                    claimed_host, err_msg = parse_domain_rpc_error(add_error)
+                    status = 409 if "custom_domain_claimed" in err_text else 500
+                    payload = {
+                        "success": False,
+                        "error": "domain_add_failed",
+                        "host": domain,
+                        "message": err_msg,
+                    }
+                    if claimed_host:
+                        payload["claim_server_key"] = claimed_host
+                    return JSONResponse(status_code=status, content=payload)
 
         for domain in domains:
             clear_domain_route_cache(domain)
@@ -1074,6 +1274,7 @@ async def register_custom_domains(request: Request):
             "success": True,
             "server_key": server_data.get("server_key"),
             "domains": domains,
+            "domain_results": domain_results,
             "render_configured": all(item.get("success") for item in render_results),
             "render_results": render_results,
             "auth_allowlist": auth_allowlist,
@@ -1111,8 +1312,13 @@ async def deregister_custom_domains(request: Request):
         if not is_owner:
             return JSONResponse(status_code=403, content={"error": ownership_error or "Forbidden"})
 
-        updated_description = remove_custom_domains_description(server_data.get("description"), domains)
-        supabase.table("mcp_servers").update({"description": updated_description}).eq("id", server_data["id"]).execute()
+        for domain in domains:
+            try:
+                rpc_remove_custom_domain(server_key, domain)
+            except Exception as remove_error:
+                print(f"⚠️ remove_custom_domain RPC failed for {domain}: {remove_error}")
+                updated_description = remove_custom_domains_description(server_data.get("description"), [domain])
+                supabase.table("mcp_servers").update({"description": updated_description}).eq("id", server_data["id"]).execute()
 
         for domain in domains:
             clear_domain_route_cache(domain)
