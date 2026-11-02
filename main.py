@@ -30,6 +30,7 @@ from bidnotice_router import bidnotice_router, handle_bidnotice_http
 from unipass_router import unipass_router
 from fedex_router import fedex_router
 from fedex_ship_router import fedex_ship_router
+from mobile_enroll_router import mobile_enroll_router
 from visitor_auth_router import handle_visitor_auth_http
 from visitor_auth_byo_gateway import (
     log_visitor_callback_path_only,
@@ -80,6 +81,7 @@ app.include_router(bidnotice_router)
 app.include_router(unipass_router)
 app.include_router(fedex_router)
 app.include_router(fedex_ship_router)
+app.include_router(mobile_enroll_router)
 
 # Configure CORS
 app.add_middleware(
