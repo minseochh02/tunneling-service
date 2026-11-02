@@ -121,3 +121,27 @@ for _action in ACTION_TO_FUNCTION:
         methods=["POST", "OPTIONS"],
         name=f"mobile_enroll_{_action.replace('-', '_')}",
     )
+
+
+async def dispatch_mobile_enroll_gateway(path: str, request: Request) -> Response | None:
+    """
+    Handle /mobile/enroll/* when the catch-all route wins matching on PRIMARY_DOMAINS.
+    (Starlette can match `/{path:path}` alongside literal API routes.)
+    """
+    prefix = "mobile/enroll/"
+    if not path.startswith(prefix):
+        return None
+
+    action = path[len(prefix) :].strip("/").split("/")[0]
+    function_name = ACTION_TO_FUNCTION.get(action)
+    if not function_name:
+        return JSONResponse({"error": "not_found"}, status_code=404)
+
+    if action == "mo-webhook":
+        gateway_secret = (os.getenv("MOBILE_ENROLL_MO_WEBHOOK_SECRET") or "").strip()
+        if gateway_secret:
+            header = request.headers.get("x-mobile-mo-secret") or ""
+            if header != gateway_secret:
+                return JSONResponse({"error": "unauthorized"}, status_code=401)
+
+    return await _proxy_enroll(request, function_name)

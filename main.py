@@ -3783,6 +3783,12 @@ async def _handle_tunnel_request(
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def custom_domain_request(path: str, request: Request):
     """Catch-all for custom domains. Reads Host and routes to the owning tunnel."""
+    from mobile_enroll_router import dispatch_mobile_enroll_gateway
+
+    mobile_enroll_response = await dispatch_mobile_enroll_gateway(path, request)
+    if mobile_enroll_response is not None:
+        return mobile_enroll_response
+
     custom_domain_response = await route_custom_domain_request(path, request)
     if custom_domain_response is not None:
         return custom_domain_response
