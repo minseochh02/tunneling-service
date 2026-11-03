@@ -30,7 +30,6 @@ from bidnotice_router import bidnotice_router, handle_bidnotice_http
 from unipass_router import unipass_router
 from fedex_router import fedex_router
 from fedex_ship_router import fedex_ship_router
-from mobile_enroll_router import mobile_enroll_router
 from visitor_auth_router import handle_visitor_auth_http
 from visitor_auth_byo_gateway import (
     log_visitor_callback_path_only,
@@ -81,7 +80,6 @@ app.include_router(bidnotice_router)
 app.include_router(unipass_router)
 app.include_router(fedex_router)
 app.include_router(fedex_ship_router)
-app.include_router(mobile_enroll_router)
 
 # Configure CORS
 app.add_middleware(
@@ -3783,12 +3781,6 @@ async def _handle_tunnel_request(
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def custom_domain_request(path: str, request: Request):
     """Catch-all for custom domains. Reads Host and routes to the owning tunnel."""
-    from mobile_enroll_router import dispatch_mobile_enroll_gateway
-
-    mobile_enroll_response = await dispatch_mobile_enroll_gateway(path, request)
-    if mobile_enroll_response is not None:
-        return mobile_enroll_response
-
     custom_domain_response = await route_custom_domain_request(path, request)
     if custom_domain_response is not None:
         return custom_domain_response
