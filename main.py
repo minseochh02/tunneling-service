@@ -49,9 +49,16 @@ from gateway_security import (
 # Load environment variables
 load_dotenv()
 
-# Initialize Supabase client
+# Initialize Supabase client (Zero-Trust Cloud Security P0:
+# Prefer least-privilege SUPABASE_TUNNEL_GATEWAY_KEY or SUPABASE_ANON_KEY over SUPABASE_SERVICE_ROLE_KEY)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+SUPABASE_TUNNEL_GATEWAY_KEY = os.getenv("SUPABASE_TUNNEL_GATEWAY_KEY")
+SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
+SUPABASE_SERVICE_ROLE_KEY = (
+    SUPABASE_TUNNEL_GATEWAY_KEY
+    or SUPABASE_ANON_KEY
+    or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+)
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID")
 # Max seconds to wait for a tunnel client response before returning 504 to the browser.
@@ -79,10 +86,15 @@ class _LazySupabaseClient:
     def _resolve(self) -> Client:
         if self._client is None:
             url = os.getenv("SUPABASE_URL") or SUPABASE_URL
-            key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or SUPABASE_SERVICE_ROLE_KEY
+            key = (
+                os.getenv("SUPABASE_TUNNEL_GATEWAY_KEY")
+                or os.getenv("SUPABASE_ANON_KEY")
+                or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+                or SUPABASE_SERVICE_ROLE_KEY
+            )
             if not url or not key:
                 raise ValueError(
-                    "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables"
+                    "SUPABASE_URL and SUPABASE_TUNNEL_GATEWAY_KEY (or SUPABASE_ANON_KEY) must be set in environment variables"
                 )
             self._client = create_client(url, key)
         return self._client
@@ -2515,34 +2527,12 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 )
 
             elif data.get("type") == "register_api_key":
-                api_key = data.get("api_key")
-                if isinstance(api_key, str) and 8 <= len(api_key.strip()) <= 256:
-                    api_key = api_key.strip()
-                    # Update Supabase instead of local memory
-                    # Store the API key in the description JSON to avoid overwriting the server_key slug
-                    try:
-                        rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "id, description")
-                        if rows:
-                            existing_row = rows[0]
-                            desc_json = {}
-                            try:
-                                desc_json = json.loads(existing_row.get("description", "{}"))
-                                if not isinstance(desc_json, dict):
-                                    desc_json = {"raw_description": existing_row.get("description")}
-                            except Exception:
-                                desc_json = {"raw_description": existing_row.get("description")}
-
-                            existing_key = desc_json.get("api_key")
-                            if existing_key and not constant_time_equals(existing_key, api_key) and not ws_authenticated:
-                                print(f"⚠️ Rejected unauthenticated api_key overwrite attempt for tunnel: {tunnel_id}")
-                            else:
-                                desc_json["api_key"] = api_key
-                                supabase.table("mcp_servers").update(
-                                    {"description": json.dumps(desc_json)}
-                                ).eq("id", existing_row["id"]).execute()
-                                print(f"🔑 API key registered in Supabase for tunnel: {tunnel_id}")
-                    except Exception as e:
-                        print(f"❌ Failed to register API key in Supabase: {e}")
+                # Zero-Trust Cloud Security (P0):
+                # Do not persist plaintext local API keys in Supabase (`mcp_servers.description.api_key`).
+                print(
+                    f"🛡️ Ignored deprecated register_api_key frame for tunnel: {tunnel_id} "
+                    "(local PC enforces caller authentication directly)"
+                )
 
             elif data["type"] == "pong":
                 # Client responded to ping - connection is healthy
