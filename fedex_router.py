@@ -10,11 +10,12 @@ import uuid
 from typing import Any
 
 import httpx
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
 
 from fedex_auth import get_access_token
 from fedex_config import credentials_from_env
+from gateway_security import verify_gateway_request_auth
 
 fedex_router = APIRouter(prefix="/fedex", tags=["FedEx"])
 
@@ -69,6 +70,7 @@ def _summarize_track_result(data: dict[str, Any]) -> list[dict[str, Any]]:
 
 @fedex_router.get("/track")
 async def track_shipments(
+    request: Request,
     trackingNumber: str | None = Query(None, description="Single FedEx tracking number"),
     trackingNumbers: str | None = Query(None, description="Comma-separated (max 30)"),
     detailed: bool = Query(True, description="includeDetailedScans"),
@@ -76,6 +78,13 @@ async def track_shipments(
     tenant_id: str = Query("default", description="Tenant id for future per-tenant track creds"),
 ):
     """Track by FedEx tracking number(s) — Basic Integrated Visibility."""
+    auth_ok, auth_err = verify_gateway_request_auth(
+        request,
+        env_keys=("FEDEX_GATEWAY_API_KEY", "GATEWAY_API_KEY"),
+    )
+    if not auth_ok:
+        return JSONResponse(status_code=401, content={"error": auth_err or "Unauthorized"})
+
     raw_list = trackingNumbers or trackingNumber or ""
     numbers = _normalize_tracking_numbers(raw_list)
     if not numbers:

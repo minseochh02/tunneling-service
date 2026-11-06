@@ -15,6 +15,8 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from gateway_security import egdesk_api_key_is_registered
+
 STATUS_URL = "https://api.odcloud.kr/api/nts-businessman/v1/status"
 VALIDATE_URL = "https://api.odcloud.kr/api/nts-businessman/v1/validate"
 MAX_BATCH = 100
@@ -247,22 +249,4 @@ async def call_tool(request: Request):
 
 
 def _egdesk_api_key_is_registered(api_key: str) -> bool:
-    url = os.getenv("SUPABASE_URL")
-    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    if not url or not service_key or not api_key:
-        return False
-    try:
-        from supabase import create_client
-
-        client = create_client(url, service_key)
-        result = client.table("mcp_servers").select("description").limit(500).execute()
-        for row in result.data or []:
-            try:
-                if json.loads(row.get("description") or "{}").get("api_key") == api_key:
-                    return True
-            except Exception:
-                continue
-    except Exception as exc:
-        print(f"⚠️ Bizverify root API key lookup failed: {exc}")
-        return False
-    return False
+    return egdesk_api_key_is_registered(api_key)

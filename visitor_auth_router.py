@@ -37,6 +37,8 @@ from fastapi import Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from supabase import Client
 
+from gateway_security import constant_time_equals, lookup_mcp_server_by_key_or_name
+
 PENDING_TTL_SECONDS = 15 * 60
 CODE_TTL_SECONDS = 2 * 60
 SESSION_TTL_SECONDS = 7 * 24 * 60 * 60
@@ -304,20 +306,15 @@ async def _verify_tunnel_api_key(tunnel_id: str, request: Request, supabase_clie
     if not api_key_header:
         return False
     try:
-        server_check = (
-            supabase_client.table("mcp_servers")
-            .select("description")
-            .or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}")
-            .execute()
-        )
+        rows = lookup_mcp_server_by_key_or_name(supabase_client, tunnel_id, "description")
         stored_key = None
-        if server_check.data:
+        if rows:
             try:
-                desc_json = json.loads(server_check.data[0].get("description") or "{}")
+                desc_json = json.loads(rows[0].get("description") or "{}")
                 stored_key = desc_json.get("api_key")
             except Exception:
                 stored_key = None
-        return bool(stored_key and stored_key == api_key_header)
+        return constant_time_equals(stored_key, api_key_header)
     except Exception:
         return False
 

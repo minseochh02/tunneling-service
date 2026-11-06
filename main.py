@@ -38,6 +38,13 @@ from visitor_auth_byo_gateway import (
 )
 from tunnel_offline_response import byo_tunnel_offline_response, tunnel_offline_response
 from supabase_auth_config import update_auth_redirect_allowlist
+from gateway_security import (
+    constant_time_equals,
+    extract_trusted_client_ip,
+    is_valid_tunnel_identifier,
+    lookup_mcp_server_by_key_or_name,
+    sanitize_tunnel_identifier,
+)
 
 # Load environment variables
 load_dotenv()
@@ -62,10 +69,33 @@ TUNNEL_BODY_BASE64_ENABLED = os.getenv("TUNNEL_BODY_BASE64_ENABLED", "true").low
     "yes",
 )
 
-if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-    raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables")
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+class _LazySupabaseClient:
+    """Allow importing main.py in unit tests without SUPABASE_URL set in the environment."""
+
+    def __init__(self) -> None:
+        self._client: Client | None = None
+
+    def _resolve(self) -> Client:
+        if self._client is None:
+            url = os.getenv("SUPABASE_URL") or SUPABASE_URL
+            key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or SUPABASE_SERVICE_ROLE_KEY
+            if not url or not key:
+                raise ValueError(
+                    "SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set in environment variables"
+                )
+            self._client = create_client(url, key)
+        return self._client
+
+    def __getattr__(self, name: str):
+        return getattr(self._resolve(), name)
+
+
+supabase: Client = (
+    create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    if (SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY)
+    else _LazySupabaseClient()  # type: ignore[assignment]
+)
 
 app = FastAPI()
 
@@ -385,16 +415,16 @@ def verify_ip_ownership(client_ip: str, stored_ip_hash: str, stored_salt: str = 
     Supports both legacy (plain IP) and new (hashed IP with salt) formats.
     This is kept for backward compatibility with servers that don't have owner_user_id.
     """
-    if not stored_ip_hash:
+    if not stored_ip_hash or not client_ip or client_ip == "unknown":
         return False
     if not stored_salt:
         # Legacy: direct comparison
-        return stored_ip_hash == client_ip
+        return constant_time_equals(stored_ip_hash, client_ip)
     else:
         # New: hash the client IP with the stored salt and compare
         combined = (client_ip + stored_salt).encode('utf-8')
         computed_hash = hashlib.sha256(combined).hexdigest()
-        return computed_hash == stored_ip_hash
+        return constant_time_equals(computed_hash, stored_ip_hash)
 
 
 def get_user_from_auth_header(request: Request) -> tuple[str | None, str | None]:
@@ -418,11 +448,9 @@ def get_user_from_auth_header(request: Request) -> tuple[str | None, str | None]
 
 
 def get_client_ip(request: Request) -> str:
-    """Extract client IP from request headers."""
-    forwarded_for = request.headers.get("x-forwarded-for")
-    real_ip = request.headers.get("x-real-ip")
+    """Extract trusted client IP from request headers behind Render/Cloudflare proxy."""
     client_host = request.client.host if request.client else None
-    return real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_host or "unknown"
+    return extract_trusted_client_ip(request.headers, client_host)
 
 
 def normalize_host(host: str | None) -> str:
@@ -931,11 +959,9 @@ async def route_custom_domain_request(path: str, request: Request):
     # (in-memory flags may be stale if access mode changed after tunnel connected)
     domain_project_map: dict = {}
     try:
-        server_result = supabase.table("mcp_servers").select("description").or_(
-            f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-        ).execute()
-        if server_result.data:
-            desc = parse_description_json(server_result.data[0].get("description"))
+        rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "description")
+        if rows:
+            desc = parse_description_json(rows[0].get("description"))
             tunnel_public_flags[tunnel_id] = load_flags_from_description(desc)
             domain_project_map = desc.get("domain_project_map") or {}
     except Exception as e:
@@ -1066,7 +1092,6 @@ async def root(request: Request):
     return {
         "service": "Tunnel Service",
         "active_tunnels": len(active_tunnels),
-        "tunnel_ids": list(active_tunnels.keys()),
         "instructions": "Connect client via WebSocket to /tunnel/connect",
         "bizinfo": {
             "tools": "/bizinfo/tools",
@@ -1150,7 +1175,7 @@ def _verify_row_owner_device(
     """Reject cross-device writes when mcp_servers.owner_device_id is set."""
     row_device = (server_data.get("owner_device_id") or "").strip()
     connect_device = (device_id or "").strip()
-    if row_device and connect_device and row_device != connect_device:
+    if row_device and connect_device != row_device:
         return False, "This tunnel id is registered to another device on your account."
     return True, None
 
@@ -1163,20 +1188,18 @@ async def register_custom_domains(request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
 
-    server_key = str(body.get("server_key") or "").strip()
+    server_key = sanitize_tunnel_identifier(str(body.get("server_key") or ""))
     domains = normalize_custom_domains(body.get("domains") or [])
     transfer = body.get("transfer") is True
 
     if not server_key:
-        return JSONResponse(status_code=400, content={"error": "server_key is required"})
+        return JSONResponse(status_code=400, content={"error": "valid server_key is required"})
     if not domains:
         return JSONResponse(status_code=400, content={"error": "At least one valid domain is required"})
 
     try:
-        server_result = supabase.table("mcp_servers").select("*").or_(
-            f"server_key.eq.{server_key},name.eq.{server_key}"
-        ).execute()
-        server_data = (server_result.data or [None])[0]
+        rows = lookup_mcp_server_by_key_or_name(supabase, server_key, "*")
+        server_data = rows[0] if rows else None
         if not server_data:
             return JSONResponse(status_code=404, content={"error": f"Server '{server_key}' not found"})
 
@@ -1294,19 +1317,17 @@ async def deregister_custom_domains(request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "Invalid JSON body"})
 
-    server_key = str(body.get("server_key") or "").strip()
+    server_key = sanitize_tunnel_identifier(str(body.get("server_key") or ""))
     domains = normalize_custom_domains(body.get("domains") or [])
 
     if not server_key:
-        return JSONResponse(status_code=400, content={"error": "server_key is required"})
+        return JSONResponse(status_code=400, content={"error": "valid server_key is required"})
     if not domains:
         return JSONResponse(status_code=400, content={"error": "At least one valid domain is required"})
 
     try:
-        server_result = supabase.table("mcp_servers").select("*").or_(
-            f"server_key.eq.{server_key},name.eq.{server_key}"
-        ).execute()
-        server_data = (server_result.data or [None])[0]
+        rows = lookup_mcp_server_by_key_or_name(supabase, server_key, "*")
+        server_data = rows[0] if rows else None
         if not server_data:
             return JSONResponse(status_code=404, content={"error": f"Server '{server_key}' not found"})
 
@@ -1371,6 +1392,15 @@ async def register_mcp(request: Request):
                     "success": False,
                     "error": "Missing required fields",
                     "message": "Both name and server_key are required"
+                }
+            )
+        if not is_valid_tunnel_identifier(str(server_key)):
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "success": False,
+                    "error": "Invalid server_key",
+                    "message": "server_key must contain only alphanumeric characters, dots, underscores, or hyphens"
                 }
             )
         
@@ -2208,26 +2238,29 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
     """Client connects here to establish tunnel"""
     await websocket.accept()
     
-    # Use server name as tunnel identifier
-    if not name:
+    # Validate and sanitize server name as tunnel identifier
+    safe_name = sanitize_tunnel_identifier(name)
+    if not safe_name:
         await _ws_send_json(
             websocket,
             _tunnel_ws_error(
-                "Server name is required as query parameter",
+                "Valid server name is required as query parameter",
                 "invalid_args",
                 False,
             ),
         )
         await _ws_close(websocket)
         return
+    name = safe_name
     
     # Check if server is registered in mcp_servers table (check by server_key or name)
-    # Try server_key first, then fallback to name for backwards compatibility
-    existing = supabase.table("mcp_servers").select(
-        "id, name, server_key, status, owner_user_id, owner_device_id, description"
-    ).or_(f"server_key.eq.{name},name.eq.{name}").execute()
+    rows = lookup_mcp_server_by_key_or_name(
+        supabase,
+        name,
+        "id, name, server_key, status, owner_user_id, owner_device_id, description",
+    )
     
-    if not existing.data or len(existing.data) == 0:
+    if not rows:
         await _ws_send_json(
             websocket,
             _tunnel_ws_error(
@@ -2239,11 +2272,73 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         await _ws_close(websocket)
         return
     
-    server_data = existing.data[0]
+    server_data = rows[0]
+
+    # Check optional Bearer token or X-Api-Key on the WebSocket handshake
+    ws_headers = {
+        k.decode("latin-1").lower(): v.decode("latin-1")
+        for k, v in (websocket.scope.get("headers") or [])
+    }
+    ws_query = websocket.query_params
+    ws_auth_header = ws_headers.get("authorization") or ""
+    ws_bearer = (
+        ws_auth_header[7:].strip()
+        if ws_auth_header.lower().startswith("bearer ")
+        else (ws_query.get("token") or "").strip()
+    )
+    ws_api_key = (ws_headers.get("x-api-key") or ws_query.get("api_key") or "").strip()
+
+    desc_initial = parse_description_json(server_data.get("description"))
+    stored_api_key = desc_initial.get("api_key")
+    owner_user_id = (server_data.get("owner_user_id") or "").strip()
+    ws_authenticated = False
+
+    if ws_bearer:
+        try:
+            user_resp = supabase.auth.get_user(ws_bearer)
+            if user_resp and user_resp.user and str(user_resp.user.id) == owner_user_id:
+                ws_authenticated = True
+            else:
+                await _ws_send_json(
+                    websocket,
+                    _tunnel_ws_error(
+                        "WebSocket Bearer token is invalid or does not belong to the server owner.",
+                        "unauthorized",
+                        False,
+                    ),
+                )
+                await _ws_close(websocket)
+                return
+        except Exception:
+            await _ws_send_json(
+                websocket,
+                _tunnel_ws_error(
+                    "WebSocket Bearer token verification failed.",
+                    "unauthorized",
+                    False,
+                ),
+            )
+            await _ws_close(websocket)
+            return
+
+    if ws_api_key:
+        if stored_api_key and constant_time_equals(stored_api_key, ws_api_key):
+            ws_authenticated = True
+        else:
+            await _ws_send_json(
+                websocket,
+                _tunnel_ws_error(
+                    "Invalid tunnel API key.",
+                    "unauthorized",
+                    False,
+                ),
+            )
+            await _ws_close(websocket)
+            return
 
     connect_device = (device_id or "").strip()
     owner_device = (server_data.get("owner_device_id") or "").strip()
-    if owner_device and connect_device and owner_device != connect_device:
+    if owner_device and connect_device != owner_device and not ws_authenticated:
         await _ws_send_json(
             websocket,
             _tunnel_ws_error(
@@ -2254,6 +2349,8 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         )
         await _ws_close(websocket)
         return
+    if owner_device and connect_device == owner_device:
+        ws_authenticated = True
 
     lease_ok, lease_error = _verify_tunnel_provider_lease(
         server_data.get("owner_user_id"),
@@ -2285,24 +2382,11 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         await _ws_close(websocket)
         return
     
-    # Note: We skip IP verification for WebSocket tunnel connections because:
-    # 1. The server is registered via Supabase Edge Function which sees a different IP than Render.com
-    # 2. Actual MCP requests through the tunnel are already protected by OAuth authentication
-    # 3. The server owner is already authenticated via Supabase auth during registration
-    # 
-    # Security is maintained because:
-    # - Only authenticated users can register servers (via Supabase Edge Function)
-    # - All requests through the tunnel require valid OAuth tokens
-    # - Permissions are checked for each request
-    
-    # Log connection info for debugging
+    # Log connection info for debugging using trusted proxy IP extraction
     client_ip = None
     if websocket.scope.get("client"):
         client_ip = websocket.scope["client"][0]
-    headers = dict(websocket.scope.get("headers", []))
-    forwarded_for = headers.get(b"x-forwarded-for", b"").decode()
-    real_ip = headers.get(b"x-real-ip", b"").decode()
-    resolved_ip = real_ip or (forwarded_for.split(',')[0].strip() if forwarded_for else None) or client_ip or "unknown"
+    resolved_ip = extract_trusted_client_ip(ws_headers, client_ip)
     
     print(f"🔌 Tunnel connection from IP: {resolved_ip} for server '{name}'")
     
@@ -2432,24 +2516,31 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
 
             elif data.get("type") == "register_api_key":
                 api_key = data.get("api_key")
-                if api_key:
+                if isinstance(api_key, str) and 8 <= len(api_key.strip()) <= 256:
+                    api_key = api_key.strip()
                     # Update Supabase instead of local memory
                     # Store the API key in the description JSON to avoid overwriting the server_key slug
                     try:
-                        # Find server by server_key OR name (slug) to be resilient
-                        server_data = supabase.table("mcp_servers").select("id, description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
-                        
-                        if server_data.data:
-                            existing_row = server_data.data[0]
+                        rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "id, description")
+                        if rows:
+                            existing_row = rows[0]
                             desc_json = {}
                             try:
                                 desc_json = json.loads(existing_row.get("description", "{}"))
-                            except:
+                                if not isinstance(desc_json, dict):
+                                    desc_json = {"raw_description": existing_row.get("description")}
+                            except Exception:
                                 desc_json = {"raw_description": existing_row.get("description")}
-                            
-                            desc_json["api_key"] = api_key
-                            supabase.table("mcp_servers").update({"description": json.dumps(desc_json)}).eq("id", existing_row["id"]).execute()
-                            print(f"🔑 API key registered in Supabase for tunnel: {tunnel_id}")
+
+                            existing_key = desc_json.get("api_key")
+                            if existing_key and not constant_time_equals(existing_key, api_key) and not ws_authenticated:
+                                print(f"⚠️ Rejected unauthenticated api_key overwrite attempt for tunnel: {tunnel_id}")
+                            else:
+                                desc_json["api_key"] = api_key
+                                supabase.table("mcp_servers").update(
+                                    {"description": json.dumps(desc_json)}
+                                ).eq("id", existing_row["id"]).execute()
+                                print(f"🔑 API key registered in Supabase for tunnel: {tunnel_id}")
                     except Exception as e:
                         print(f"❌ Failed to register API key in Supabase: {e}")
 
@@ -2535,7 +2626,6 @@ async def ping_server(tunnel_id: str, request: Request):
             content={
                 "online": False,
                 "error": "Server offline or not connected",
-                "active_tunnels": list(active_tunnels.keys())
             }
         )
     
@@ -2709,13 +2799,11 @@ async def session_exchange(tunnel_id: str, request: Request):
         user_id = user.id
 
         # Get server info
-        server = supabase.table("mcp_servers").select("*").or_(
-            f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-        ).execute()
-        if not server.data:
+        rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "*")
+        if not rows:
             return JSONResponse(status_code=404, content={"error": "Server not found"})
 
-        server_data = server.data[0]
+        server_data = rows[0]
         server_id = server_data["id"]
 
         # Check if user is the owner (owners always have access)
@@ -2783,14 +2871,11 @@ async def set_tunnel_access_mode(tunnel_id: str, request: Request):
     project_name = body.get("project")  # Optional: per-project access mode
 
     # Verify the requester is the tunnel owner
-    server_check = supabase.table("mcp_servers").select("*").or_(
-        f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-    ).execute()
-
-    if not server_check.data:
+    rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "*")
+    if not rows:
         return JSONResponse(status_code=404, content={"error": "Tunnel not found"})
 
-    server_data = server_check.data[0]
+    server_data = rows[0]
     is_owner, err = verify_ownership(request, server_data)
     if not is_owner:
         return JSONResponse(status_code=403, content={"error": err or "Forbidden"})
@@ -2856,14 +2941,11 @@ async def set_tunnel_domain_mapping(tunnel_id: str, request: Request):
         return JSONResponse(status_code=400, content={"error": "domain is required"})
 
     # Verify ownership
-    server_check = supabase.table("mcp_servers").select("*").or_(
-        f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-    ).execute()
-
-    if not server_check.data:
+    rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "*")
+    if not rows:
         return JSONResponse(status_code=404, content={"error": "Tunnel not found"})
 
-    server_data = server_check.data[0]
+    server_data = rows[0]
     is_owner, err = verify_ownership(request, server_data)
     if not is_owner:
         return JSONResponse(status_code=403, content={"error": err or "Forbidden"})
@@ -3043,17 +3125,15 @@ async def _handle_tunnel_request(
                 },
             )
         try:
-            server_check = supabase.table("mcp_servers").select("description").or_(
-                f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-            ).execute()
+            rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "description")
             stored_key = None
-            if server_check.data:
+            if rows:
                 try:
-                    desc_json = json.loads(server_check.data[0].get("description") or "{}")
+                    desc_json = json.loads(rows[0].get("description") or "{}")
                     stored_key = desc_json.get("api_key")
                 except Exception:
                     stored_key = None
-            if not stored_key or stored_key != api_key_header:
+            if not constant_time_equals(stored_key, api_key_header):
                 return JSONResponse(
                     status_code=401,
                     content={"error": "Unauthorized", "message": "Invalid API key"},
@@ -3087,17 +3167,15 @@ async def _handle_tunnel_request(
                 },
             )
         try:
-            server_check = supabase.table("mcp_servers").select("description").or_(
-                f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-            ).execute()
+            rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "description")
             stored_key = None
-            if server_check.data:
+            if rows:
                 try:
-                    desc_json = json.loads(server_check.data[0].get("description") or "{}")
+                    desc_json = json.loads(rows[0].get("description") or "{}")
                     stored_key = desc_json.get("api_key")
                 except Exception:
                     stored_key = None
-            if not stored_key or stored_key != api_key_header:
+            if not constant_time_equals(stored_key, api_key_header):
                 return JSONResponse(
                     status_code=401,
                     content={"error": "Unauthorized", "message": "Invalid API key"},
@@ -3131,17 +3209,15 @@ async def _handle_tunnel_request(
                 },
             )
         try:
-            server_check = supabase.table("mcp_servers").select("description").or_(
-                f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-            ).execute()
+            rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "description")
             stored_key = None
-            if server_check.data:
+            if rows:
                 try:
-                    desc_json = json.loads(server_check.data[0].get("description") or "{}")
+                    desc_json = json.loads(rows[0].get("description") or "{}")
                     stored_key = desc_json.get("api_key")
                 except Exception:
                     stored_key = None
-            if not stored_key or stored_key != api_key_header:
+            if not constant_time_equals(stored_key, api_key_header):
                 return JSONResponse(
                     status_code=401,
                     content={"error": "Unauthorized", "message": "Invalid API key"},
@@ -3175,17 +3251,15 @@ async def _handle_tunnel_request(
                 },
             )
         try:
-            server_check = supabase.table("mcp_servers").select("description").or_(
-                f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-            ).execute()
+            rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "description")
             stored_key = None
-            if server_check.data:
+            if rows:
                 try:
-                    desc_json = json.loads(server_check.data[0].get("description") or "{}")
+                    desc_json = json.loads(rows[0].get("description") or "{}")
                     stored_key = desc_json.get("api_key")
                 except Exception:
                     stored_key = None
-            if not stored_key or stored_key != api_key_header:
+            if not constant_time_equals(stored_key, api_key_header):
                 return JSONResponse(
                     status_code=401,
                     content={"error": "Unauthorized", "message": "Invalid API key"},
@@ -3219,17 +3293,15 @@ async def _handle_tunnel_request(
                 },
             )
         try:
-            server_check = supabase.table("mcp_servers").select("description").or_(
-                f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-            ).execute()
+            rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "description")
             stored_key = None
-            if server_check.data:
+            if rows:
                 try:
-                    desc_json = json.loads(server_check.data[0].get("description") or "{}")
+                    desc_json = json.loads(rows[0].get("description") or "{}")
                     stored_key = desc_json.get("api_key")
                 except Exception:
                     stored_key = None
-            if not stored_key or stored_key != api_key_header:
+            if not constant_time_equals(stored_key, api_key_header):
                 return JSONResponse(
                     status_code=401,
                     content={"error": "Unauthorized", "message": "Invalid API key"},
@@ -3352,16 +3424,16 @@ async def _handle_tunnel_request(
         # Query Supabase for the key stored in the description JSON
         try:
             # Find server by server_key OR name (slug) to be resilient
-            server_check = supabase.table("mcp_servers").select("description").or_(f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}").execute()
+            rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "description")
             stored_key = None
-            if server_check.data:
+            if rows:
                 try:
-                    desc_json = json.loads(server_check.data[0].get("description", "{}"))
+                    desc_json = json.loads(rows[0].get("description", "{}"))
                     stored_key = desc_json.get("api_key")
-                except:
+                except Exception:
                     pass
             
-            if not stored_key or stored_key != api_key_header:
+            if not constant_time_equals(stored_key, api_key_header):
                 return JSONResponse(
                     status_code=401,
                     content={"error": "Unauthorized", "message": "Invalid API key"}
@@ -3553,11 +3625,9 @@ async def _handle_tunnel_request(
     if should_forward_byo_callback_to_desktop(path, request):
         forwarded_headers["x-egdesk-visitor-client-ip"] = get_client_ip(request)
     try:
-        server_result = supabase.table("mcp_servers").select("description").or_(
-            f"server_key.eq.{tunnel_id},name.eq.{tunnel_id}"
-        ).execute()
-        if server_result.data:
-            desc = parse_description_json(server_result.data[0].get("description"))
+        rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "description")
+        if rows:
+            desc = parse_description_json(rows[0].get("description"))
             domain_project_map = desc.get("domain_project_map") or {}
             request_host = request.headers.get(
                 "host", "tunneling-service.onrender.com"

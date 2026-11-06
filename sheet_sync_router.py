@@ -20,6 +20,12 @@ import httpx
 import json
 import os
 
+from gateway_security import (
+    validate_google_drive_id,
+    validate_outbound_webhook_url,
+    verify_gateway_request_auth,
+)
+
 # Optional: Google API support
 try:
     from google.oauth2 import service_account
@@ -103,14 +109,36 @@ class BatchUpdateRequest(BaseModel):
 # Electron Registration Endpoints
 # =============================================================================
 
+def _require_sheet_sync_auth(request: Request) -> None:
+    """Enforce authentication on privileged sheet-sync endpoints."""
+    allow_unauth = (os.getenv("SHEET_SYNC_ALLOW_UNAUTHENTICATED") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    ok, err = verify_gateway_request_auth(
+        request,
+        env_keys=("SHEET_SYNC_API_KEY", "GATEWAY_API_KEY"),
+        require_by_default=not allow_unauth,
+    )
+    if not ok:
+        raise HTTPException(status_code=401, detail=err or "Unauthorized")
+
+
 @sheet_sync_router.post("/register-electron")
-async def register_electron(data: ElectronRegistration):
+async def register_electron(data: ElectronRegistration, request: Request):
     """
     Register Electron app's callback URL for a specific spreadsheet.
     Called by Electron when it starts up or connects to a spreadsheet.
     """
-    spreadsheet_id = data.spreadsheet_id
-    electron_callbacks[spreadsheet_id] = data.callback_url
+    _require_sheet_sync_auth(request)
+    try:
+        spreadsheet_id = validate_google_drive_id(data.spreadsheet_id, "spreadsheet_id")
+        validated_callback_url = validate_outbound_webhook_url(data.callback_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    electron_callbacks[spreadsheet_id] = validated_callback_url
     
     # Initialize sync status
     if spreadsheet_id not in sheet_sync_status:
@@ -128,9 +156,9 @@ async def register_electron(data: ElectronRegistration):
     
     if pending:
         try:
-            async with httpx.AsyncClient() as client:
+            async with httpx.AsyncClient(follow_redirects=False) as client:
                 response = await client.post(
-                    data.callback_url,
+                    validated_callback_url,
                     json={"changes": pending, "type": "pending_flush"},
                     timeout=10.0
                 )
@@ -142,19 +170,20 @@ async def register_electron(data: ElectronRegistration):
             # Re-queue the changes
             pending_changes[spreadsheet_id] = pending
     
-    print(f"✅ Registered Electron callback for {spreadsheet_id}: {data.callback_url}")
+    print(f"✅ Registered Electron callback for {spreadsheet_id}: {validated_callback_url}")
     
     return {
         "status": "registered",
         "spreadsheet_id": spreadsheet_id,
-        "callback_url": data.callback_url,
+        "callback_url": validated_callback_url,
         "pending_flushed": forwarded
     }
 
 
 @sheet_sync_router.post("/unregister-electron/{spreadsheet_id}")
-async def unregister_electron(spreadsheet_id: str):
+async def unregister_electron(spreadsheet_id: str, request: Request):
     """Unregister Electron callback (e.g., on app close)"""
+    _require_sheet_sync_auth(request)
     electron_callbacks.pop(spreadsheet_id, None)
     print(f"🔌 Unregistered Electron callback for {spreadsheet_id}")
     return {"status": "unregistered", "spreadsheet_id": spreadsheet_id}
@@ -216,9 +245,10 @@ async def receive_sheet_changes(data: SheetChangesPayload):
     
     # Forward to Electron
     try:
-        async with httpx.AsyncClient() as client:
+        validated_callback_url = validate_outbound_webhook_url(callback_url)
+        async with httpx.AsyncClient(follow_redirects=False) as client:
             response = await client.post(
-                callback_url,
+                validated_callback_url,
                 json={"changes": changes, "type": "sheet_changes"},
                 timeout=10.0
             )
@@ -267,9 +297,10 @@ async def function_executed(data: FunctionExecutedEvent):
         return {"status": "no_callback", "event_logged": True}
     
     try:
-        async with httpx.AsyncClient() as client:
+        validated_callback_url = validate_outbound_webhook_url(callback_url)
+        async with httpx.AsyncClient(follow_redirects=False) as client:
             response = await client.post(
-                callback_url,
+                validated_callback_url,
                 json={"event": event, "type": "function_executed"},
                 timeout=10.0
             )
@@ -284,14 +315,18 @@ async def function_executed(data: FunctionExecutedEvent):
 # =============================================================================
 
 @sheet_sync_router.post("/apps-script")
-async def proxy_apps_script(data: AppsScriptCall):
+async def proxy_apps_script(data: AppsScriptCall, request: Request):
     """
     Proxy calls to Google Apps Script Execution API.
     Electron calls this → we call Apps Script.
     """
+    _require_sheet_sync_auth(request)
     function_name = data.function
     parameters = data.parameters
-    spreadsheet_id = data.spreadsheetId
+    try:
+        spreadsheet_id = validate_google_drive_id(data.spreadsheetId, "spreadsheetId")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     
     print(f"📞 Apps Script call: {function_name}({len(parameters)} params) for {spreadsheet_id}")
     
@@ -342,13 +377,20 @@ async def proxy_apps_script(data: AppsScriptCall):
 # =============================================================================
 
 @sheet_sync_router.post("/create-from-template")
-async def create_from_template(data: TemplateCreationRequest):
+async def create_from_template(data: TemplateCreationRequest, request: Request):
     """
     Create a new spreadsheet from template and inject db.gs.
     """
+    _require_sheet_sync_auth(request)
     if not GOOGLE_APIS_AVAILABLE:
         raise HTTPException(status_code=501, detail="Google API libraries not installed")
     
+    try:
+        template_id = validate_google_drive_id(data.template_id, "template_id")
+        folder_id = validate_google_drive_id(data.folder_id, "folder_id") if data.folder_id else None
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     try:
         credentials = get_google_credentials()
         drive = build('drive', 'v3', credentials=credentials)
@@ -356,11 +398,11 @@ async def create_from_template(data: TemplateCreationRequest):
         
         # Step 1: Copy template
         copy_body = {'name': data.new_name}
-        if data.folder_id:
-            copy_body['parents'] = [data.folder_id]
+        if folder_id:
+            copy_body['parents'] = [folder_id]
             
         copy_response = drive.files().copy(
-            fileId=data.template_id,
+            fileId=template_id,
             body=copy_body
         ).execute()
         
@@ -405,17 +447,23 @@ async def create_from_template(data: TemplateCreationRequest):
 # =============================================================================
 
 @sheet_sync_router.post("/batch-update")
-async def batch_update_cells(data: BatchUpdateRequest):
+async def batch_update_cells(data: BatchUpdateRequest, request: Request):
     """
     Batch update cells in a spreadsheet.
     Called by Electron to push local SQLite changes to Sheet.
     """
+    _require_sheet_sync_auth(request)
     if not GOOGLE_APIS_AVAILABLE:
         raise HTTPException(status_code=501, detail="Google API libraries not installed")
     
     try:
+        spreadsheet_id = validate_google_drive_id(data.spreadsheetId, "spreadsheetId")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    try:
         credentials = get_google_credentials()
-        script_id = await get_script_id_for_spreadsheet(data.spreadsheetId, credentials)
+        script_id = await get_script_id_for_spreadsheet(spreadsheet_id, credentials)
         service = build('script', 'v1', credentials=credentials)
         
         response = service.scripts().run(
@@ -432,8 +480,8 @@ async def batch_update_cells(data: BatchUpdateRequest):
         result = response.get('response', {}).get('result', {})
         
         # Update sync status
-        if data.spreadsheetId in sheet_sync_status:
-            sheet_sync_status[data.spreadsheetId]["last_pull"] = datetime.utcnow().isoformat()
+        if spreadsheet_id in sheet_sync_status:
+            sheet_sync_status[spreadsheet_id]["last_pull"] = datetime.utcnow().isoformat()
         
         return result
         
@@ -449,8 +497,9 @@ async def batch_update_cells(data: BatchUpdateRequest):
 # =============================================================================
 
 @sheet_sync_router.get("/stats")
-async def sheet_sync_stats():
+async def sheet_sync_stats(request: Request):
     """Get sheet sync statistics"""
+    _require_sheet_sync_auth(request)
     return {
         "registered_spreadsheets": list(electron_callbacks.keys()),
         "pending_changes": {k: len(v) for k, v in pending_changes.items()},
@@ -512,7 +561,7 @@ def get_google_credentials():
 
 async def get_script_id_for_spreadsheet(spreadsheet_id: str, credentials) -> str:
     """Get the Apps Script ID bound to a spreadsheet"""
-    
+    spreadsheet_id = validate_google_drive_id(spreadsheet_id, "spreadsheet_id")
     if spreadsheet_id in script_id_cache:
         return script_id_cache[spreadsheet_id]
     
@@ -536,7 +585,7 @@ async def get_script_id_for_spreadsheet(spreadsheet_id: str, credentials) -> str
 
 async def get_or_create_bound_script(drive, script, spreadsheet_id: str) -> str:
     """Get existing or create new bound script project"""
-    
+    spreadsheet_id = validate_google_drive_id(spreadsheet_id, "spreadsheet_id")
     try:
         files = drive.files().list(
             q=f"mimeType='application/vnd.google-apps.script' and '{spreadsheet_id}' in parents",

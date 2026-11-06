@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, Response
 
 from fedex_config import credentials_from_payload
 from fedex_labels import (
+    _sanitize_label_id,
     get_idempotent_result,
     load_label_pdf,
     new_label_id,
@@ -25,6 +26,7 @@ from fedex_ship_schema import (
     ShipSheetRow,
 )
 from fedex_ship_service import create_shipment, fetch_rate_services
+from gateway_security import verify_gateway_request_auth
 
 fedex_ship_router = APIRouter(prefix="/fedex", tags=["FedEx Ship"])
 
@@ -72,6 +74,13 @@ async def ship_validate(body: ShipValidateRequest):
 @fedex_ship_router.post("/ship/rate")
 async def ship_rate(body: RateQuoteRequest, request: Request):
     """Return service types available for origin/destination/weight."""
+    auth_ok, auth_err = verify_gateway_request_auth(
+        request,
+        env_keys=("FEDEX_GATEWAY_API_KEY", "GATEWAY_API_KEY"),
+    )
+    if not auth_ok:
+        return JSONResponse(status_code=401, content={"error": auth_err or "Unauthorized"})
+
     creds, err = _resolve_creds(body.tenant_id, body.credentials)
     if err:
         return JSONResponse(status_code=503, content={"error": err})
@@ -88,8 +97,8 @@ async def ship_rate(body: RateQuoteRequest, request: Request):
     return {
         "ok": True,
         "apiBase": creds.base_url(),
-        "allowed_services": sorted(services),
-        "count": len(services),
+        "allowed_services": sorted(allowed_services := services),
+        "count": len(allowed_services),
         "raw": raw if os.getenv("FEDEX_DEBUG") else None,
     }
 
@@ -97,6 +106,13 @@ async def ship_rate(body: RateQuoteRequest, request: Request):
 @fedex_ship_router.post("/ship/batch")
 async def ship_batch(body: ShipBatchRequest, request: Request):
     """Validate and ship many rows; one PDF label per row."""
+    auth_ok, auth_err = verify_gateway_request_auth(
+        request,
+        env_keys=("FEDEX_GATEWAY_API_KEY", "GATEWAY_API_KEY"),
+    )
+    if not auth_ok:
+        return JSONResponse(status_code=401, content={"error": auth_err or "Unauthorized"})
+
     creds, err = _resolve_creds(body.tenant_id, body.credentials)
     if err:
         return JSONResponse(status_code=503, content={"error": err})
@@ -249,7 +265,10 @@ async def get_label_pdf(
     download: bool = Query(False, description="If true, force attachment download"),
 ):
     """Serve stored 4x6 label PDF (inline view or download)."""
-    pdf = load_label_pdf(label_id, tenant_id)
+    safe_label = _sanitize_label_id(label_id)
+    if not safe_label:
+        return JSONResponse(status_code=400, content={"error": "Invalid label_id."})
+    pdf = load_label_pdf(safe_label, tenant_id)
     if pdf is None:
         return JSONResponse(status_code=404, content={"error": "Label not found."})
 
@@ -258,6 +277,6 @@ async def get_label_pdf(
         content=pdf,
         media_type="application/pdf",
         headers={
-            "Content-Disposition": f'{disposition}; filename="fedex-label-{label_id}.pdf"',
+            "Content-Disposition": f'{disposition}; filename="fedex-label-{safe_label}.pdf"',
         },
     )

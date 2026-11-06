@@ -21,6 +21,8 @@ import httpx
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
 
+from gateway_security import egdesk_api_key_is_registered, safe_xml_fromstring
+
 KONEPS_BASE = "https://apis.data.go.kr/1230000/ao/CntrctInfoService"
 KONEPS_APPLY_URL = "https://www.data.go.kr/data/15129427/openapi.do"
 MAX_ROWS = 100
@@ -261,7 +263,7 @@ def parse_payload(text: str) -> dict[str, Any]:
             raise RuntimeError(koneps_fault_message(code, msg))
         return data
     try:
-        root = ET.fromstring(raw)
+        root = safe_xml_fromstring(raw)
     except ET.ParseError as exc:
         raise RuntimeError(f"나라장터 API 응답 파싱 실패: {raw[:200]}") from exc
     fault = root.find(".//cmmMsgHeader")
@@ -620,22 +622,4 @@ async def call_tool(request: Request):
 
 
 def _egdesk_api_key_is_registered(api_key: str) -> bool:
-    url = os.getenv("SUPABASE_URL")
-    service_key = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
-    if not url or not service_key or not api_key:
-        return False
-    try:
-        from supabase import create_client
-
-        client = create_client(url, service_key)
-        result = client.table("mcp_servers").select("description").limit(500).execute()
-        for row in result.data or []:
-            try:
-                if json.loads(row.get("description") or "{}").get("api_key") == api_key:
-                    return True
-            except Exception:
-                continue
-    except Exception as exc:
-        print(f"⚠️ KONEPS root API key lookup failed: {exc}")
-        return False
-    return False
+    return egdesk_api_key_is_registered(api_key)

@@ -19,8 +19,10 @@ from typing import Any
 from xml.etree import ElementTree
 
 import httpx
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import JSONResponse
+
+from gateway_security import safe_xml_fromstring, verify_gateway_request_auth
 
 _DEFAULT_UNIPASS_BASE = "https://unipass.customs.go.kr:38010/ext/rest/"
 UNIPASS_BASE = (os.getenv("UNIPASS_BASE_URL") or _DEFAULT_UNIPASS_BASE).strip()
@@ -84,7 +86,7 @@ def _local(tag: str) -> str:
 
 
 def _parse_xml(text: str) -> dict[str, Any]:
-    root = ElementTree.fromstring(text)
+    root = safe_xml_fromstring(text)
     out: dict[str, Any] = {}
     for child in list(root):
         name = _local(child.tag)
@@ -99,7 +101,7 @@ def _parse_xml(text: str) -> dict[str, Any]:
 
 def _records(text: str, tag: str) -> tuple[list[dict[str, str]], list[str]]:
     """Return every direct child. Empty tags are listed once so we can see the full schema."""
-    root = ElementTree.fromstring(text)
+    root = safe_xml_fromstring(text)
     rows: list[dict[str, str]] = []
     empty: list[str] = []
     for child in root.iter():
@@ -120,7 +122,7 @@ def _records(text: str, tag: str) -> tuple[list[dict[str, str]], list[str]]:
 
 def _rows_with_field(text: str, field: str) -> list[dict[str, str]]:
     """Collect elements that carry `field` (UNI-PASS VO tag names vary by API)."""
-    root = ElementTree.fromstring(text)
+    root = safe_xml_fromstring(text)
     rows: list[dict[str, str]] = []
     for elem in root.iter():
         row = {
@@ -322,11 +324,19 @@ def _years(year: str | None) -> list[str]:
 
 @unipass_router.get("/cargo")
 async def cargo_lookup(
+    request: Request,
     bl: str = Query(..., description="B/L 번호 또는 화물관리번호"),
     year: str | None = Query(None, description="B/L 연도 YYYY. 생략하면 최근 3년"),
     kind: str = Query("auto", description="auto | hbl | mbl | carg"),
 ):
     """Test whether 관세청 화물통관진행정보 can resolve this B/L."""
+    auth_ok, auth_err = verify_gateway_request_auth(
+        request,
+        env_keys=("UNIPASS_GATEWAY_API_KEY", "GATEWAY_API_KEY"),
+    )
+    if not auth_ok:
+        return JSONResponse(status_code=401, content={"error": auth_err or "Unauthorized"})
+
     bl_no = "".join(bl.split())
     if not bl_no:
         return JSONResponse(status_code=400, content={"error": "bl is required"})
@@ -416,11 +426,19 @@ async def cargo_lookup(
 
 @unipass_router.get("/fxrt")
 async def exchange_rate(
+    request: Request,
     date: str = Query(..., description="조회년월일 YYYYMMDD"),
     imex: str = Query("2", description="1 수출, 2 수입"),
     curr: str | None = Query(None, description="통화부호. 예: USD. 생략하면 전체"),
 ):
     """관세환율정보조회 (API012). Uses UNIPASS_FXRT_KEY."""
+    auth_ok, auth_err = verify_gateway_request_auth(
+        request,
+        env_keys=("UNIPASS_GATEWAY_API_KEY", "GATEWAY_API_KEY"),
+    )
+    if not auth_ok:
+        return JSONResponse(status_code=401, content={"error": auth_err or "Unauthorized"})
+
     qry = "".join(ch for ch in date if ch.isdigit())
     if len(qry) != 8:
         return JSONResponse(status_code=400, content={"error": "date must be YYYYMMDD"})
@@ -486,11 +504,19 @@ async def exchange_rate(
 
 @unipass_router.get("/imp-pay")
 async def import_tax_payment(
+    request: Request,
     impDclrNo: str | None = Query(None, description="수입신고번호 (예: 2317626122128M)"),
     bl: str | None = Query(None, description="House B/L — cargo에서 신고번호 추출"),
     year: str | None = Query(None, description="B/L 연도 YYYY"),
 ):
     """수입 제세 납부여부 및 납부일자. Uses UNIPASS_IMP_PAY_KEY."""
+    auth_ok, auth_err = verify_gateway_request_auth(
+        request,
+        env_keys=("UNIPASS_GATEWAY_API_KEY", "GATEWAY_API_KEY"),
+    )
+    if not auth_ok:
+        return JSONResponse(status_code=401, content={"error": auth_err or "Unauthorized"})
+
     dclr, resolved_from, err = await _resolve_imp_dclr_no(impDclrNo, bl, year)
     if err is not None:
         return err
@@ -572,11 +598,19 @@ async def import_tax_payment(
 
 @unipass_router.get("/imp-rlse")
 async def import_bonded_area_release(
+    request: Request,
     impDclrNo: str | None = Query(None, description="수입신고번호 (반출입근거번호 rlbrBssNo)"),
     bl: str | None = Query(None, description="House B/L — cargo에서 신고번호 추출"),
     year: str | None = Query(None, description="B/L 연도 YYYY"),
 ):
     """수입물품 보세구역 반출신고 정보 (API048). Uses UNIPASS_IMP_RLSE_KEY."""
+    auth_ok, auth_err = verify_gateway_request_auth(
+        request,
+        env_keys=("UNIPASS_GATEWAY_API_KEY", "GATEWAY_API_KEY"),
+    )
+    if not auth_ok:
+        return JSONResponse(status_code=401, content={"error": auth_err or "Unauthorized"})
+
     dclr, resolved_from, err = await _resolve_imp_dclr_no(impDclrNo, bl, year)
     if err is not None:
         return err

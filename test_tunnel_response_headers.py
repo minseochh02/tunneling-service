@@ -1,3 +1,4 @@
+import unittest
 from main import _sanitize_tunnel_response_headers
 
 
@@ -24,3 +25,15 @@ def test_sanitize_head_keeps_origin_content_length():
         "HEAD",
     )
     assert out["content-length"] == "555"
+
+
+class TunnelResponseHeaderTests(unittest.TestCase):
+    def test_drops_chunked_and_sets_content_length(self):
+        test_sanitize_drops_chunked_and_sets_content_length()
+
+    def test_head_keeps_origin_content_length(self):
+        test_sanitize_head_keeps_origin_content_length()
+
+
+if __name__ == "__main__":
+    unittest.main()
