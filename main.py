@@ -1105,6 +1105,7 @@ async def root(request: Request):
     return {
         "service": "Tunnel Service",
         "active_tunnels": len(active_tunnels),
+        "tunnel_ids": list(active_tunnels.keys()),
         "instructions": "Connect client via WebSocket to /tunnel/connect",
         "bizinfo": {
             "tools": "/bizinfo/tools",
