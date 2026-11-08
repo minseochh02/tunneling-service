@@ -50,14 +50,15 @@ from gateway_security import (
 load_dotenv()
 
 # Initialize Supabase client (Zero-Trust Cloud Security P0:
-# Prefer least-privilege SUPABASE_TUNNEL_GATEWAY_KEY or SUPABASE_ANON_KEY over SUPABASE_SERVICE_ROLE_KEY)
+# Prefer least-privilege SUPABASE_TUNNEL_GATEWAY_KEY over SUPABASE_SERVICE_ROLE_KEY;
+# only fall back to SUPABASE_ANON_KEY if neither is set, since RLS blocks anon reads on mcp_servers)
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_TUNNEL_GATEWAY_KEY = os.getenv("SUPABASE_TUNNEL_GATEWAY_KEY")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY")
 SUPABASE_SERVICE_ROLE_KEY = (
     SUPABASE_TUNNEL_GATEWAY_KEY
-    or SUPABASE_ANON_KEY
     or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+    or SUPABASE_ANON_KEY
 )
 RENDER_API_KEY = os.getenv("RENDER_API_KEY")
 RENDER_SERVICE_ID = os.getenv("RENDER_SERVICE_ID")
@@ -88,8 +89,8 @@ class _LazySupabaseClient:
             url = os.getenv("SUPABASE_URL") or SUPABASE_URL
             key = (
                 os.getenv("SUPABASE_TUNNEL_GATEWAY_KEY")
-                or os.getenv("SUPABASE_ANON_KEY")
                 or os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+                or os.getenv("SUPABASE_ANON_KEY")
                 or SUPABASE_SERVICE_ROLE_KEY
             )
             if not url or not key:
