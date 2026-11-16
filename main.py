@@ -51,7 +51,7 @@ from gateway_security import (
 load_dotenv()
 
 # Bump when changing WS close logging (grep Render logs for this string to verify deploy).
-TUNNEL_WS_LOG_BUILD = "2026-03-24-ws-close-v3"
+TUNNEL_WS_LOG_BUILD = "2026-11-16-device-deny-v1"
 _uvicorn_log = logging.getLogger("uvicorn.error")
 
 
@@ -169,6 +169,38 @@ streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 # Throttle rapid retryable WebSocket connect attempts (legacy clients ignore code fields).
 _tunnel_ws_retry_gate: dict[str, float] = {}
 _TUNNEL_WS_MIN_RETRY_INTERVAL_SEC = float(os.getenv("TUNNEL_WS_MIN_RETRY_INTERVAL_SEC", "2"))
+
+_DEVICE_DENY_CACHE: set[str] = set()
+_DEVICE_DENY_CACHE_AT: float = 0.0
+_TUNNEL_DEVICE_DENY_CACHE_SEC = 15.0
+_TUNNEL_DEVICE_DENYLIST_ENV = {
+    d.strip()
+    for d in (os.getenv("TUNNEL_DEVICE_DENYLIST") or "").split(",")
+    if d.strip()
+}
+
+
+def _is_tunnel_device_denied(device_id: str | None) -> bool:
+    """Admin denylist (Supabase + optional env) — cheap cache under connect storms."""
+    device_id = (device_id or "").strip()
+    if not device_id:
+        return False
+    if device_id in _TUNNEL_DEVICE_DENYLIST_ENV:
+        return True
+    global _DEVICE_DENY_CACHE, _DEVICE_DENY_CACHE_AT
+    now = time.time()
+    if now - _DEVICE_DENY_CACHE_AT >= _TUNNEL_DEVICE_DENY_CACHE_SEC:
+        try:
+            result = supabase.table("tunnel_device_denies").select("device_id").execute()
+            _DEVICE_DENY_CACHE = {
+                (row.get("device_id") or "").strip()
+                for row in (result.data or [])
+                if (row.get("device_id") or "").strip()
+            }
+        except Exception as exc:
+            print(f"⚠️ tunnel_device_denies lookup failed: {exc}")
+        _DEVICE_DENY_CACHE_AT = now
+    return device_id in _DEVICE_DENY_CACHE
 
 
 def fail_pending_requests_for_tunnel(tunnel_id: str, reason: str = "tunnel_disconnect") -> int:
@@ -2334,6 +2366,17 @@ def _verify_tunnel_provider_lease(
 @app.websocket("/tunnel/connect")
 async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str = None):
     """Client connects here to establish tunnel"""
+    connect_device_early = (device_id or "").strip()
+    if connect_device_early and _is_tunnel_device_denied(connect_device_early):
+        _emit_tunnel_ws(
+            "tunnel_ws_device_denied build=%s device_id=%s name=%s",
+            TUNNEL_WS_LOG_BUILD,
+            connect_device_early,
+            sanitize_tunnel_identifier(name) or "?",
+        )
+        await websocket.close(code=1008, reason="device_disabled")
+        return
+
     ws_session = {
         "phase": "connecting",
         "code": None,
