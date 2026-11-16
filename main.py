@@ -11,6 +11,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import asyncio
 import json
+import logging
 import uuid
 import os
 import hashlib
@@ -48,6 +49,9 @@ from gateway_security import (
 
 # Load environment variables
 load_dotenv()
+
+# Use logging (not print) so Render shows tunnel lifecycle next to uvicorn INFO lines.
+tunnel_ws_log = logging.getLogger("tunnel.ws")
 
 # Initialize Supabase client (Zero-Trust Cloud Security P0:
 # Prefer least-privilege SUPABASE_TUNNEL_GATEWAY_KEY over SUPABASE_SERVICE_ROLE_KEY;
@@ -111,6 +115,13 @@ supabase: Client = (
 )
 
 app = FastAPI()
+
+
+@app.on_event("startup")
+async def _tunnel_ws_logging_startup() -> None:
+    tunnel_ws_log.setLevel(logging.INFO)
+    tunnel_ws_log.propagate = True
+
 
 # After your app is created, include the router
 
@@ -356,6 +367,26 @@ def _format_ws_close(
     return " ".join(parts)
 
 
+def _log_tunnel_ws_close(
+    tunnel_id: str,
+    phase: str,
+    code: int | None,
+    reason: object | None = None,
+    *,
+    initiator: str = "unknown",
+    extra: str | None = None,
+) -> None:
+    detail = _format_ws_close(code, reason, initiator=initiator)
+    suffix = f" {extra}" if extra else ""
+    tunnel_ws_log.info(
+        "tunnel_ws_session_end tunnel=%s phase=%s %s%s",
+        tunnel_id,
+        phase,
+        detail,
+        suffix,
+    )
+
+
 async def _ws_close(
     websocket: WebSocket,
     *,
@@ -365,11 +396,12 @@ async def _ws_close(
 ) -> None:
     try:
         if websocket.client_state == WebSocketState.CONNECTED:
-            if log_label:
-                print(
-                    f"🔌 Server closing WebSocket ({log_label}): "
-                    f"{_format_ws_close(code, reason, initiator='server')}"
-                )
+            label = log_label or "handshake"
+            tunnel_ws_log.info(
+                "tunnel_ws_server_close label=%s %s",
+                label,
+                _format_ws_close(code, reason, initiator="server"),
+            )
             await websocket.close(code=code, reason=reason or "")
     except Exception:
         pass
@@ -430,9 +462,17 @@ async def _receive_until_takeover(
     except json.JSONDecodeError as exc:
         return None, f"invalid_json:{exc}", None
     except WebSocketDisconnect as exc:
+        tunnel_ws_log.info(
+            "tunnel_ws_client_disconnect %s",
+            _format_ws_close(exc.code, exc.reason, initiator="client"),
+        )
         return None, "disconnected", (exc.code, exc.reason or "")
     except RuntimeError as exc:
         # Abrupt drop (proxy LB, TCP reset) often surfaces here without a close frame.
+        tunnel_ws_log.info(
+            "tunnel_ws_client_disconnect %s",
+            _format_ws_close(1006, str(exc), initiator="client"),
+        )
         return None, "disconnected", (1006, str(exc))
     except Exception as exc:
         return None, f"error:{exc}", None
@@ -2287,8 +2327,34 @@ def _verify_tunnel_provider_lease(
 @app.websocket("/tunnel/connect")
 async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str = None):
     """Client connects here to establish tunnel"""
+    ws_session = {
+        "phase": "connecting",
+        "code": None,
+        "reason": None,
+        "initiator": "unknown",
+    }
+
+    def _remember_ws_close(
+        code: int | None,
+        reason: object | None = None,
+        *,
+        initiator: str,
+        phase: str | None = None,
+    ) -> None:
+        ws_session["code"] = code
+        ws_session["reason"] = _ws_close_reason_text(reason)
+        ws_session["initiator"] = initiator
+        if phase:
+            ws_session["phase"] = phase
+
     await websocket.accept()
-    
+    ws_session["phase"] = "accepted"
+    tunnel_ws_log.info(
+        "tunnel_ws_accept path=/tunnel/connect name=%s device_id=%s",
+        sanitize_tunnel_identifier(name) or "?",
+        (device_id or "").strip() or "-",
+    )
+
     # Validate and sanitize server name as tunnel identifier
     safe_name = sanitize_tunnel_identifier(name)
     if not safe_name:
@@ -2482,10 +2548,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
             "public_url": f"https://tunneling-service.onrender.com/t/{tunnel_id}/"
         })
         if not sent:
-            print(
-                f"✗ Tunnel {tunnel_id} closed before connected ack "
-                f"({_format_ws_close(None, None, initiator='client')})"
-            )
+            _remember_ws_close(None, None, initiator="client", phase="pre_connected_ack")
             return
 
         async def heartbeat():
@@ -2498,10 +2561,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                     try:
                         _ensure_active_tunnel(tunnel_id, websocket)
                         if not await _ws_send_json(websocket, {"type": "ping", "timestamp": datetime.now().isoformat()}):
-                            print(
-                                f"💔 Heartbeat failed for {tunnel_id}: "
-                                f"{_format_ws_close(None, None, initiator='client')}"
-                            )
+                            _remember_ws_close(None, None, initiator="client", phase="heartbeat_send")
                             break
                     except Exception as e:
                         print(f"💔 Heartbeat failed for {tunnel_id}: {e}")
@@ -2515,6 +2575,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         while True:
             if _session_replaced(tunnel_id, websocket, takeover):
                 print(f"🔌 Tunnel {tunnel_id} replaced — closing this socket")
+                _remember_ws_close(1000, "replaced_by_new_session", initiator="server", phase="replaced")
                 await _ws_close(
                     websocket,
                     reason="replaced_by_new_session",
@@ -2528,6 +2589,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 continue
             if receive_status == "replaced" or _session_replaced(tunnel_id, websocket, takeover):
                 print(f"🔌 Tunnel {tunnel_id} replaced — closing this socket")
+                _remember_ws_close(1000, "replaced_by_new_session", initiator="server", phase="replaced")
                 await _ws_close(
                     websocket,
                     reason="replaced_by_new_session",
@@ -2536,13 +2598,11 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 break
             if receive_status == "disconnected":
                 close_code, close_reason = client_close or (None, None)
-                print(
-                    f"🔌 WebSocket disconnected: {tunnel_id} "
-                    f"{_format_ws_close(close_code, close_reason, initiator='client')}"
-                )
+                _remember_ws_close(close_code, close_reason, initiator="client", phase="receive_loop")
                 break
             if receive_status or data is None:
                 print(f"❌ Unexpected WebSocket error: {receive_status}")
+                _remember_ws_close(1011, receive_status, initiator="server", phase="receive_error")
                 break
 
             print(f"📨 WebSocket message received: type={data.get('type')}, request_id={data.get('request_id')}")
@@ -2601,20 +2661,31 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 _ensure_active_tunnel(tunnel_id, websocket)
                 print(f"💓 Heartbeat received from {tunnel_id}, responding with pong")
                 if not await _ws_send_json(websocket, {"type": "pong", "timestamp": data.get("timestamp", datetime.now().isoformat())}):
-                    print(
-                        f"🔌 WebSocket closed while replying pong: {tunnel_id} "
-                        f"{_format_ws_close(None, None, initiator='client')}"
-                    )
+                    _remember_ws_close(None, None, initiator="client", phase="pong_reply")
                     break
 
     except WebSocketDisconnect as exc:
+        _remember_ws_close(exc.code, exc.reason, initiator="client", phase="handler")
         print(
             f"✗ Tunnel disconnected: {tunnel_id} "
             f"{_format_ws_close(exc.code, exc.reason, initiator='client')}"
         )
+    except asyncio.CancelledError:
+        _remember_ws_close(1001, "server_shutdown", initiator="server", phase=ws_session["phase"])
+        raise
     except Exception as e:
+        _remember_ws_close(1011, str(e), initiator="server", phase="handler_error")
         print(f"✗ Tunnel error for {tunnel_id}: {e}")
     finally:
+        if ws_session["code"] is None and websocket.client_state == WebSocketState.DISCONNECTED:
+            _remember_ws_close(1006, "no_close_frame_recorded", initiator="client", phase=ws_session["phase"])
+        _log_tunnel_ws_close(
+            tunnel_id,
+            ws_session["phase"],
+            ws_session["code"],
+            ws_session["reason"],
+            initiator=ws_session["initiator"],
+        )
         # Clean up — only if this socket still owns the name
         if heartbeat_task:
             heartbeat_task.cancel()
