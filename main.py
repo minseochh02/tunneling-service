@@ -333,10 +333,44 @@ async def _ws_send_json(websocket: WebSocket, payload: dict) -> bool:
         return False
 
 
-async def _ws_close(websocket: WebSocket) -> None:
+def _ws_close_reason_text(reason: object | None) -> str:
+    if reason is None:
+        return "(none)"
+    if isinstance(reason, bytes):
+        return reason.decode("utf-8", errors="replace") or "(none)"
+    text = str(reason).strip()
+    return text or "(none)"
+
+
+def _format_ws_close(
+    code: int | None,
+    reason: object | None = None,
+    *,
+    initiator: str | None = None,
+) -> str:
+    """Human-readable close frame for Render log correlation (1001/1006/etc.)."""
+    parts = [f"code={code if code is not None else '?'}"]
+    parts.append(f"reason={_ws_close_reason_text(reason)}")
+    if initiator:
+        parts.append(f"initiator={initiator}")
+    return " ".join(parts)
+
+
+async def _ws_close(
+    websocket: WebSocket,
+    *,
+    code: int = 1000,
+    reason: str | None = None,
+    log_label: str | None = None,
+) -> None:
     try:
         if websocket.client_state == WebSocketState.CONNECTED:
-            await websocket.close()
+            if log_label:
+                print(
+                    f"🔌 Server closing WebSocket ({log_label}): "
+                    f"{_format_ws_close(code, reason, initiator='server')}"
+                )
+            await websocket.close(code=code, reason=reason or "")
     except Exception:
         pass
 
@@ -371,8 +405,8 @@ def _session_replaced(tunnel_id: str, websocket: WebSocket, takeover: asyncio.Ev
 
 async def _receive_until_takeover(
     websocket: WebSocket, takeover: asyncio.Event
-) -> tuple[dict | None, str | None]:
-    """Wait for a JSON message or a replace signal. None, reason if the loop should stop."""
+) -> tuple[dict | None, str | None, tuple[int | None, str | None] | None]:
+    """Wait for JSON or takeover. Third value is (close_code, close_reason) when the client drops."""
     receive_task = asyncio.create_task(websocket.receive_json())
     takeover_task = asyncio.create_task(takeover.wait())
     done, pending = await asyncio.wait(
@@ -387,18 +421,21 @@ async def _receive_until_takeover(
             pass
 
     if takeover.is_set():
-        return None, "replaced"
+        return None, "replaced", None
     if receive_task not in done:
-        return None, "replaced"
+        return None, "replaced", None
 
     try:
-        return receive_task.result(), None
+        return receive_task.result(), None, None
     except json.JSONDecodeError as exc:
-        return None, f"invalid_json:{exc}"
-    except (WebSocketDisconnect, RuntimeError):
-        return None, "disconnected"
+        return None, f"invalid_json:{exc}", None
+    except WebSocketDisconnect as exc:
+        return None, "disconnected", (exc.code, exc.reason or "")
+    except RuntimeError as exc:
+        # Abrupt drop (proxy LB, TCP reset) often surfaces here without a close frame.
+        return None, "disconnected", (1006, str(exc))
     except Exception as exc:
-        return None, f"error:{exc}"
+        return None, f"error:{exc}", None
 
 # Session storage for authenticated iframe access
 # {session_token: {user_id, user_email, tunnel_id, created_at, expires_at}}
@@ -2445,7 +2482,10 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
             "public_url": f"https://tunneling-service.onrender.com/t/{tunnel_id}/"
         })
         if not sent:
-            print(f"✗ Tunnel {tunnel_id} closed before connected ack")
+            print(
+                f"✗ Tunnel {tunnel_id} closed before connected ack "
+                f"({_format_ws_close(None, None, initiator='client')})"
+            )
             return
 
         async def heartbeat():
@@ -2458,7 +2498,10 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                     try:
                         _ensure_active_tunnel(tunnel_id, websocket)
                         if not await _ws_send_json(websocket, {"type": "ping", "timestamp": datetime.now().isoformat()}):
-                            print(f"💔 Heartbeat failed for {tunnel_id}: socket closed")
+                            print(
+                                f"💔 Heartbeat failed for {tunnel_id}: "
+                                f"{_format_ws_close(None, None, initiator='client')}"
+                            )
                             break
                     except Exception as e:
                         print(f"💔 Heartbeat failed for {tunnel_id}: {e}")
@@ -2472,19 +2515,31 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         while True:
             if _session_replaced(tunnel_id, websocket, takeover):
                 print(f"🔌 Tunnel {tunnel_id} replaced — closing this socket")
-                await _ws_close(websocket)
+                await _ws_close(
+                    websocket,
+                    reason="replaced_by_new_session",
+                    log_label=tunnel_id,
+                )
                 break
 
-            data, receive_status = await _receive_until_takeover(websocket, takeover)
+            data, receive_status, client_close = await _receive_until_takeover(websocket, takeover)
             if receive_status and receive_status.startswith("invalid_json"):
                 print(f"⚠️ Invalid JSON received: {receive_status}")
                 continue
             if receive_status == "replaced" or _session_replaced(tunnel_id, websocket, takeover):
                 print(f"🔌 Tunnel {tunnel_id} replaced — closing this socket")
-                await _ws_close(websocket)
+                await _ws_close(
+                    websocket,
+                    reason="replaced_by_new_session",
+                    log_label=tunnel_id,
+                )
                 break
             if receive_status == "disconnected":
-                print(f"🔌 WebSocket disconnected: {tunnel_id}")
+                close_code, close_reason = client_close or (None, None)
+                print(
+                    f"🔌 WebSocket disconnected: {tunnel_id} "
+                    f"{_format_ws_close(close_code, close_reason, initiator='client')}"
+                )
                 break
             if receive_status or data is None:
                 print(f"❌ Unexpected WebSocket error: {receive_status}")
@@ -2546,10 +2601,17 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 _ensure_active_tunnel(tunnel_id, websocket)
                 print(f"💓 Heartbeat received from {tunnel_id}, responding with pong")
                 if not await _ws_send_json(websocket, {"type": "pong", "timestamp": data.get("timestamp", datetime.now().isoformat())}):
+                    print(
+                        f"🔌 WebSocket closed while replying pong: {tunnel_id} "
+                        f"{_format_ws_close(None, None, initiator='client')}"
+                    )
                     break
 
-    except WebSocketDisconnect:
-        print(f"✗ Tunnel disconnected: {tunnel_id}")
+    except WebSocketDisconnect as exc:
+        print(
+            f"✗ Tunnel disconnected: {tunnel_id} "
+            f"{_format_ws_close(exc.code, exc.reason, initiator='client')}"
+        )
     except Exception as e:
         print(f"✗ Tunnel error for {tunnel_id}: {e}")
     finally:
