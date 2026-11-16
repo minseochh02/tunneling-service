@@ -50,8 +50,16 @@ from gateway_security import (
 # Load environment variables
 load_dotenv()
 
-# Use logging (not print) so Render shows tunnel lifecycle next to uvicorn INFO lines.
-tunnel_ws_log = logging.getLogger("tunnel.ws")
+# Bump when changing WS close logging (grep Render logs for this string to verify deploy).
+TUNNEL_WS_LOG_BUILD = "2026-03-24-ws-close-v3"
+_uvicorn_log = logging.getLogger("uvicorn.error")
+
+
+def _emit_tunnel_ws(msg: str, *args: object) -> None:
+    """Mirror uvicorn's `INFO:     ...` lines so Render log UI shows tunnel diagnostics."""
+    text = msg % args if args else msg
+    _uvicorn_log.info("%s", text)
+    print(f"INFO:     {text}", flush=True)
 
 # Initialize Supabase client (Zero-Trust Cloud Security P0:
 # Prefer least-privilege SUPABASE_TUNNEL_GATEWAY_KEY over SUPABASE_SERVICE_ROLE_KEY;
@@ -119,8 +127,7 @@ app = FastAPI()
 
 @app.on_event("startup")
 async def _tunnel_ws_logging_startup() -> None:
-    tunnel_ws_log.setLevel(logging.INFO)
-    tunnel_ws_log.propagate = True
+    _emit_tunnel_ws("tunnel_ws_build=%s", TUNNEL_WS_LOG_BUILD)
 
 
 # After your app is created, include the router
@@ -378,7 +385,7 @@ def _log_tunnel_ws_close(
 ) -> None:
     detail = _format_ws_close(code, reason, initiator=initiator)
     suffix = f" {extra}" if extra else ""
-    tunnel_ws_log.info(
+    _emit_tunnel_ws(
         "tunnel_ws_session_end tunnel=%s phase=%s %s%s",
         tunnel_id,
         phase,
@@ -397,7 +404,7 @@ async def _ws_close(
     try:
         if websocket.client_state == WebSocketState.CONNECTED:
             label = log_label or "handshake"
-            tunnel_ws_log.info(
+            _emit_tunnel_ws(
                 "tunnel_ws_server_close label=%s %s",
                 label,
                 _format_ws_close(code, reason, initiator="server"),
@@ -462,14 +469,14 @@ async def _receive_until_takeover(
     except json.JSONDecodeError as exc:
         return None, f"invalid_json:{exc}", None
     except WebSocketDisconnect as exc:
-        tunnel_ws_log.info(
+        _emit_tunnel_ws(
             "tunnel_ws_client_disconnect %s",
             _format_ws_close(exc.code, exc.reason, initiator="client"),
         )
         return None, "disconnected", (exc.code, exc.reason or "")
     except RuntimeError as exc:
         # Abrupt drop (proxy LB, TCP reset) often surfaces here without a close frame.
-        tunnel_ws_log.info(
+        _emit_tunnel_ws(
             "tunnel_ws_client_disconnect %s",
             _format_ws_close(1006, str(exc), initiator="client"),
         )
@@ -2347,9 +2354,27 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
         if phase:
             ws_session["phase"] = phase
 
+    async def _reject_handshake(tunnel_label: str, reject_reason: str) -> None:
+        _remember_ws_close(1000, reject_reason, initiator="server", phase="handshake")
+        await _ws_close(websocket, reason=reject_reason, log_label=tunnel_label)
+        _log_tunnel_ws_close(
+            tunnel_label,
+            "handshake",
+            1000,
+            reject_reason,
+            initiator="server",
+        )
+
+    _emit_tunnel_ws(
+        "tunnel_ws_handler_enter build=%s name=%s device_id=%s",
+        TUNNEL_WS_LOG_BUILD,
+        sanitize_tunnel_identifier(name) or "?",
+        (device_id or "").strip() or "-",
+    )
+
     await websocket.accept()
     ws_session["phase"] = "accepted"
-    tunnel_ws_log.info(
+    _emit_tunnel_ws(
         "tunnel_ws_accept path=/tunnel/connect name=%s device_id=%s",
         sanitize_tunnel_identifier(name) or "?",
         (device_id or "").strip() or "-",
@@ -2366,7 +2391,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 False,
             ),
         )
-        await _ws_close(websocket)
+        await _reject_handshake("?", "invalid_args")
         return
     name = safe_name
     
@@ -2386,7 +2411,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 True,
             ),
         )
-        await _ws_close(websocket)
+        await _reject_handshake(name, "not_registered")
         return
     
     server_data = rows[0]
@@ -2424,7 +2449,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                         False,
                     ),
                 )
-                await _ws_close(websocket)
+                await _reject_handshake(name, "unauthorized_bearer")
                 return
         except Exception:
             await _ws_send_json(
@@ -2435,7 +2460,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                     False,
                 ),
             )
-            await _ws_close(websocket)
+            await _reject_handshake(name, "unauthorized_bearer_verify_failed")
             return
 
     if ws_api_key:
@@ -2450,7 +2475,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                     False,
                 ),
             )
-            await _ws_close(websocket)
+            await _reject_handshake(name, "unauthorized_api_key")
             return
 
     connect_device = (device_id or "").strip()
@@ -2464,7 +2489,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 False,
             ),
         )
-        await _ws_close(websocket)
+        await _reject_handshake(name, "device_tunnel_mismatch")
         return
     if owner_device and connect_device == owner_device:
         ws_authenticated = True
@@ -2483,7 +2508,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 True,
             )
         await _ws_send_json(websocket, payload)
-        await _ws_close(websocket)
+        await _reject_handshake(name, str(payload.get("code") or "lease_rejected"))
         return
     
     # Check if server is active
@@ -2496,7 +2521,7 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
                 False,
             ),
         )
-        await _ws_close(websocket)
+        await _reject_handshake(name, "not_active")
         return
     
     # Log connection info for debugging using trusted proxy IP extraction
