@@ -531,6 +531,7 @@ domain_route_cache = {}  # {domain: (tunnel_id, timestamp)}
 DOMAIN_ROUTE_CACHE_TTL_SECONDS = 300
 PRIMARY_DOMAINS = {
     "tunneling-service.onrender.com",
+    "tunneling-service-dev.onrender.com",
     "domains.egdesk.cloud",
     "egdesk.cloud",
     "www.egdesk.cloud",
