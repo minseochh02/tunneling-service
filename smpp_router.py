@@ -1,8 +1,9 @@
 """
 SMPP (중소벤처기업부 기술개발제품 인증현황) — executed on the tunnel gateway.
 
-DATA_GO_KR_API_KEY lives here (dataset 3033913). Desktop calls via callPublicDataGateway only.
+DATA_GO_KR_API_KEY lives here (datasets 3033913 + 3049999). Desktop calls via callPublicDataGateway only.
 Swagger: https://infuser.odcloud.kr/oas/docs?namespace=3033913/v1
+Supplement: https://infuser.odcloud.kr/oas/docs?namespace=3049999/v1 (KHIDI 보건신기술 NET)
 """
 
 from __future__ import annotations
@@ -20,8 +21,10 @@ from fastapi.responses import JSONResponse
 from gateway_security import egdesk_api_key_is_registered
 
 SMPP_APPLY_URL = "https://www.data.go.kr/data/3033913/openapi.do"
+KHIDI_NET_APPLY_URL = "https://www.data.go.kr/data/3049999/openapi.do"
 MAX_PER_PAGE = 100
 LOOKUP_MAX_PAGES = 160
+KHIDI_MAX_PAGES = 20
 
 SMPP_RESOURCES = [
     {
@@ -31,6 +34,18 @@ SMPP_RESOURCES = [
     {
         "resource_id": "uddi:834e8428-51b3-420b-9fd4-aaee942e4916",
         "snapshot_label": "중소벤처기업부_기술개발제품 인증현황_20250512",
+    },
+]
+
+# KHIDI 보건신기술(NET) — often present here when MSS 3033913 CSV lags (e.g. 티이바이오스).
+KHIDI_NET_RESOURCES = [
+    {
+        "resource_id": "uddi:e2a4a21b-3c4d-4262-83ef-947e0f57f58d",
+        "snapshot_label": "한국보건산업진흥원_보건신기술 인증 결과_20231222",
+    },
+    {
+        "resource_id": "uddi:1e396da5-3cff-4851-8cbe-c32cd3a45e7a",
+        "snapshot_label": "한국보건산업진흥원_보건신기술 인증 결과_20221031",
     },
 ]
 
@@ -51,9 +66,10 @@ CATEGORY_HINTS: dict[str, list[str]] = {
 }
 
 SMPP_PURPOSE = (
-    "중소벤처기업부 기술개발제품 인증현황 (SMPP / data.go.kr 3033913). "
+    "중소벤처기업부 기술개발제품 인증현황 (SMPP / data.go.kr 3033913) "
+    "plus KHIDI 보건신기술(NET) supplement (3049999) on lookup when 업체명 is given. "
     "Static CSV via api.odcloud.kr — not live smpp.go.kr. "
-    "Company name matched client-side (server cond[업체명::LIKE] is unreliable)."
+    "Company name matched client-side (server cond[업체명::LIKE] is unreliable on 3033913)."
 )
 
 SMPP_TOOLS = [
@@ -77,7 +93,8 @@ SMPP_TOOLS = [
     },
     {
         "name": "smpp_lookup",
-        "description": SMPP_PURPOSE + " Lookup by 업체명 or 사업자등록번호.",
+        "description": SMPP_PURPOSE
+        + " Lookup by 업체명 or 사업자등록번호. 업체명 also queries KHIDI 3049999 (보건 NET).",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -142,6 +159,28 @@ def normalize_row(row: dict) -> dict[str, str]:
         "representative": str(row.get("대표자") or "").strip(),
         "certifiedAt": str(row.get("인증일자") or "").strip(),
         "expiresAt": str(row.get("만료일자") or "").strip(),
+        "sourceDataset": "3033913",
+    }
+
+
+def normalize_khidi_row(row: dict) -> dict[str, str]:
+    domain = str(row.get("분야") or "").strip()
+    cert_label = "보건신기술(NET)"
+    if domain:
+        cert_label = f"{cert_label} · {domain}"
+    seq_no = row.get("연번") if row.get("연번") is not None else row.get("No")
+    return {
+        "certCategory": cert_label,
+        "certNumber": str(seq_no or "").strip(),
+        "productName": str(row.get("기술명") or row.get("기술명(국문명)") or "").strip(),
+        "companyName": str(row.get("업체") or row.get("기업명") or "").strip(),
+        "businessNumber": "",
+        "representative": str(row.get("이름") or "").strip(),
+        "certifiedAt": str(row.get("인증일") or "").strip(),
+        "expiresAt": str(row.get("인증만료일") or "").strip(),
+        "certificationTerm": str(row.get("인증기간") or "").strip(),
+        "netDomain": domain,
+        "sourceDataset": "3049999",
     }
 
 
@@ -203,6 +242,48 @@ def post_filter_rows(rows: list[dict], args: dict) -> list[dict]:
     return out
 
 
+def post_filter_khidi_rows(rows: list[dict], args: dict) -> list[dict]:
+    out = rows
+    company = str(args.get("companyName") or "").strip()
+    if company:
+        variants = company_name_variants(company)
+        out = [r for r in out if row_matches_company(variants, r.get("companyName") or "")]
+    product = str(args.get("productName") or "").strip()
+    if product:
+        out = [r for r in out if product in (r.get("productName") or "")]
+    category_id = str(args.get("certCategory") or "").strip()
+    net_domain = str(args.get("netDomain") or "").strip()
+    if category_id and category_id != "net":
+        return []
+    if net_domain:
+        out = [r for r in out if net_domain in (r.get("netDomain") or "")]
+    return out
+
+
+def khidi_fault_message(status: int, text: str) -> str:
+    if status == 401:
+        return (
+            "DATA_GO_KR_API_KEY is not approved for 보건신기술(NET) (3049999). "
+            f"Apply at {KHIDI_NET_APPLY_URL}"
+        )
+    if status == 403 or "LIMITED_NUMBER_OF_SERVICE_REQUESTS_EXCEEDS_ERROR" in text:
+        return "data.go.kr daily quota exceeded for dataset 3049999."
+    return f"api.odcloud.kr HTTP {status}: {text[:200]}"
+
+
+def should_query_khidi_net(args: dict) -> bool:
+    company = str(args.get("companyName") or "").strip()
+    if not company:
+        return False
+    category_id = str(args.get("certCategory") or "").strip()
+    if category_id and category_id != "net":
+        return False
+    label = str(args.get("certCategoryLabel") or "").strip()
+    if label and "NET" not in label and "보건" not in label:
+        return False
+    return True
+
+
 def odcloud_fault_message(status: int, text: str) -> str:
     if status == 401:
         return (
@@ -258,6 +339,158 @@ async def fetch_raw_page(
         "resource_id": resource_id,
         "snapshot_label": snapshot_label,
     }
+
+
+async def fetch_khidi_page(
+    args: dict,
+    resource_id: str,
+    snapshot_label: str,
+) -> dict[str, Any]:
+    key = _service_key()
+    if not key:
+        raise missing_key_error()
+
+    page = max(1, int(args.get("page") or 1))
+    per_page = min(MAX_PER_PAGE, max(1, int(args.get("display") or 100)))
+    url = f"https://api.odcloud.kr/api/3049999/v1/{resource_id}"
+    params: dict[str, Any] = {
+        "serviceKey": key,
+        "returnType": "JSON",
+        "page": page,
+        "perPage": per_page,
+    }
+    company = str(args.get("companyName") or "").strip()
+    if company:
+        core = re.sub(r"^(주식회사|\(주\)|㈜)\s*", "", company).strip()
+        if len(core) >= 2:
+            params["cond[업체::LIKE]"] = core
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        resp = await client.get(url, params=params)
+    text = resp.text
+    if resp.status_code >= 400:
+        raise RuntimeError(khidi_fault_message(resp.status_code, text))
+
+    try:
+        payload = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"KHIDI 응답 파싱 실패: {text[:200]}") from exc
+
+    raw_rows = payload.get("data") or []
+    rows = [normalize_khidi_row(row or {}) for row in raw_rows]
+
+    return {
+        "page": int(payload.get("page") or page),
+        "perPage": int(payload.get("perPage") or per_page),
+        "totalCount": int(payload.get("totalCount") or 0),
+        "matchCount": int(payload.get("matchCount") or 0),
+        "currentCount": int(payload.get("currentCount") or len(raw_rows)),
+        "rows": rows,
+        "resource_id": resource_id,
+        "snapshot_label": snapshot_label,
+    }
+
+
+async def search_khidi_net(args: dict) -> tuple[list[dict], dict[str, Any] | None]:
+    scan_args = {**args, "display": MAX_PER_PAGE}
+    collected: list[dict] = []
+    last_raw: dict[str, Any] | None = None
+    pages_scanned = 0
+
+    for resource in KHIDI_NET_RESOURCES:
+        resource_hits: list[dict] = []
+        for page in range(1, KHIDI_MAX_PAGES + 1):
+            pages_scanned += 1
+            raw = await fetch_khidi_page({**scan_args, "page": page}, resource["resource_id"], resource["snapshot_label"])
+            last_raw = raw
+            resource_hits.extend(post_filter_khidi_rows(raw["rows"], args))
+            if raw["currentCount"] < MAX_PER_PAGE:
+                break
+        if resource_hits:
+            collected = resource_hits
+            break
+        if collected:
+            break
+
+    if not collected and last_raw:
+        for page in range(1, KHIDI_MAX_PAGES + 1):
+            raw = await fetch_khidi_page(
+                {**scan_args, "page": page, "companyName": None},
+                KHIDI_NET_RESOURCES[0]["resource_id"],
+                KHIDI_NET_RESOURCES[0]["snapshot_label"],
+            )
+            last_raw = raw
+            pages_scanned += 1
+            hits = post_filter_khidi_rows(raw["rows"], args)
+            if hits:
+                collected = hits
+                break
+            if raw["currentCount"] < MAX_PER_PAGE:
+                break
+
+    meta = {
+        "datasetId": "3049999",
+        "datasetSnapshot": (last_raw or {}).get("snapshot_label"),
+        "resourceUddi": (last_raw or {}).get("resource_id"),
+        "pagesScanned": pages_scanned,
+        "swaggerUrl": "https://infuser.odcloud.kr/oas/docs?namespace=3049999/v1",
+        "returnedCount": len(collected),
+    }
+    return collected, meta if last_raw else None
+
+
+def merge_khidi_items(mss: dict[str, Any], khidi_items: list[dict], khidi_meta: dict[str, Any] | None) -> dict[str, Any]:
+    if not khidi_items:
+        return mss
+
+    existing = list(mss.get("items") or [])
+    seen = {
+        (
+            (i.get("productName") or "").strip(),
+            (i.get("companyName") or "").strip(),
+            (i.get("expiresAt") or "").strip(),
+            (i.get("sourceDataset") or "3033913"),
+        )
+        for i in existing
+    }
+    added = 0
+    for row in khidi_items:
+        key = (
+            (row.get("productName") or "").strip(),
+            (row.get("companyName") or "").strip(),
+            (row.get("expiresAt") or "").strip(),
+            "3049999",
+        )
+        if key in seen:
+            continue
+        existing.append(row)
+        seen.add(key)
+        added += 1
+
+    mss["items"] = existing
+    mss["returnedCount"] = len(existing)
+    if mss.get("notFoundInSnapshot") and added:
+        mss.pop("notFoundInSnapshot", None)
+    mss["khidiNetSupplement"] = {
+        **(khidi_meta or {}),
+        "mergedCount": added,
+        "note": (
+            "KHIDI 보건신기술(NET) from data.go.kr 3049999 — may appear here when absent from MSS 3033913 CSV."
+        ),
+    }
+    return mss
+
+
+async def enrich_with_khidi_net(result: dict[str, Any], args: dict) -> dict[str, Any]:
+    if not should_query_khidi_net(args):
+        return result
+    try:
+        khidi_items, khidi_meta = await search_khidi_net(args)
+    except Exception as exc:
+        print(f"⚠️ KHIDI NET supplement skipped: {exc}")
+        result["khidiNetSupplement"] = {"datasetId": "3049999", "error": str(exc)}
+        return result
+    return merge_khidi_items(result, khidi_items, khidi_meta)
 
 
 def wrap_result(raw: dict, args: dict, items: list[dict], extra: dict | None = None) -> dict[str, Any]:
@@ -340,7 +573,7 @@ async def scan_for_company(args: dict, max_pages: int = LOOKUP_MAX_PAGES) -> dic
     )
 
 
-async def search_certifications(args: dict) -> dict[str, Any]:
+async def _search_certifications_mss(args: dict) -> dict[str, Any]:
     company = str(args.get("companyName") or "").strip()
     company_only = (
         company
@@ -369,12 +602,28 @@ async def search_certifications(args: dict) -> dict[str, Any]:
     return wrap_result(raw, args, post_filter_rows(raw["rows"], args))
 
 
+async def search_certifications(args: dict) -> dict[str, Any]:
+    result = await _search_certifications_mss(args)
+    if should_query_khidi_net(args):
+        result = await enrich_with_khidi_net(result, args)
+    return result
+
+
 async def lookup_company(args: dict) -> dict[str, Any]:
     company = str(args.get("companyName") or "").strip()
     bn = normalize_bno(args.get("businessNumber"))
     if not company and not bn:
         raise RuntimeError("companyName or businessNumber is required")
-    return await search_certifications({**args, "page": 1})
+    result = await _search_certifications_mss({**args, "page": 1})
+    if company:
+        result = await enrich_with_khidi_net(result, args)
+    elif bn:
+        result["khidiNetSupplement"] = {
+            "datasetId": "3049999",
+            "skipped": True,
+            "reason": "3049999 export has no 사업자등록번호 — pass companyName for KHIDI NET supplement.",
+        }
+    return result
 
 
 def has_predicate(args: dict) -> bool:
