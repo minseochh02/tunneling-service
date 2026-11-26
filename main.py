@@ -28,6 +28,7 @@ from bizverify_router import bizverify_router, handle_bizverify_http
 from nps_router import nps_router, handle_nps_http
 from koneps_router import koneps_router, handle_koneps_http
 from bidnotice_router import bidnotice_router, handle_bidnotice_http
+from smpp_router import smpp_router, handle_smpp_http
 from unipass_router import unipass_router
 from fedex_router import fedex_router
 from fedex_ship_router import fedex_ship_router
@@ -138,6 +139,7 @@ app.include_router(bizverify_router)
 app.include_router(nps_router)
 app.include_router(koneps_router)
 app.include_router(bidnotice_router)
+app.include_router(smpp_router)
 app.include_router(unipass_router)
 app.include_router(fedex_router)
 app.include_router(fedex_ship_router)
@@ -1243,6 +1245,11 @@ async def root(request: Request):
             "tools": "/bidnotice/tools",
             "call": "/bidnotice/tools/call",
             "tunnel": "/t/{tunnelId}/bidnotice/tools/call",
+        },
+        "smpp": {
+            "tools": "/smpp/tools",
+            "call": "/smpp/tools/call",
+            "tunnel": "/t/{tunnelId}/smpp/tools/call",
         },
         "unipass": {
             "cargo": "/unipass/cargo?bl={blNo}",
@@ -3514,6 +3521,47 @@ async def _handle_tunnel_request(
         print(f"📢 BidNotice gateway: {request.method} /{path} for tunnel {tunnel_id}")
         return await handle_bidnotice_http(request.method, path[len("bidnotice/"):], body)
 
+    # ============================================
+    # SMPP (기술개발제품 인증현황) — handled on this gateway. Dataset 3033913.
+    # ============================================
+    if path == "smpp/tools" or path.startswith("smpp/tools/"):
+        api_key_header = request.headers.get("X-Api-Key")
+        if not api_key_header:
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "Unauthorized",
+                    "message": "Missing X-Api-Key. EGDesk tunnel API key is required for SMPP.",
+                },
+            )
+        try:
+            rows = lookup_mcp_server_by_key_or_name(supabase, tunnel_id, "description")
+            stored_key = None
+            if rows:
+                try:
+                    desc_json = json.loads(rows[0].get("description") or "{}")
+                    stored_key = desc_json.get("api_key")
+                except Exception:
+                    stored_key = None
+            if not constant_time_equals(stored_key, api_key_header):
+                return JSONResponse(
+                    status_code=401,
+                    content={"error": "Unauthorized", "message": "Invalid API key"},
+                )
+        except Exception as e:
+            print(f"⚠️ SMPP API key check failed: {e}")
+            return JSONResponse(status_code=500, content={"error": "Authentication check failed"})
+
+        body = None
+        if request.method == "POST":
+            try:
+                raw = await request.body()
+                body = json.loads(raw.decode() or "{}") if raw else {}
+            except Exception:
+                body = {}
+        print(f"📋 SMPP gateway: {request.method} /{path} for tunnel {tunnel_id}")
+        return await handle_smpp_http(request.method, path[len("smpp/"):], body)
+
     # Check if tunnel exists locally
     if tunnel_id not in active_tunnels:
         print(f"❌ Tunnel '{tunnel_id}' not found locally. Active local tunnels: {list(active_tunnels.keys())}")
@@ -3546,6 +3594,8 @@ async def _handle_tunnel_request(
         "koneps/tools/call",
         "bidnotice/tools",
         "bidnotice/tools/call",
+        "smpp/tools",
+        "smpp/tools/call",
     }
     # Google redirects the browser here after visitor login. This must stay
     # unauthenticated — otherwise the gateway sends users to egdesk.cloud/auth/tunnel-login.
