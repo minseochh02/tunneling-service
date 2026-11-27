@@ -166,6 +166,9 @@ active_tunnels = {}  # {tunnel_id: websocket}
 # tunnel_api_keys = {}  # REMOVED: Now stored in Supabase 'mcp_servers' table
 pending_requests = {}  # {request_id: asyncio.Future}
 pending_request_tunnels: dict[str, str] = {}  # request_id -> tunnel_id
+# request_id -> the WebSocket the request was sent over (so a replaced socket's in-flight
+# requests can be failed without touching the replacement socket's requests).
+pending_request_sockets: dict[str, WebSocket] = {}
 streaming_requests = {}  # {request_id: asyncio.Queue} for SSE streaming
 
 # Throttle rapid retryable WebSocket connect attempts (legacy clients ignore code fields).
@@ -205,17 +208,32 @@ def _is_tunnel_device_denied(device_id: str | None) -> bool:
     return device_id in _DEVICE_DENY_CACHE
 
 
-def fail_pending_requests_for_tunnel(tunnel_id: str, reason: str = "tunnel_disconnect") -> int:
+def fail_pending_requests_for_tunnel(
+    tunnel_id: str,
+    reason: str = "tunnel_disconnect",
+    websocket: WebSocket | None = None,
+) -> int:
     """
     When the desktop WebSocket drops mid-request, the client may finish locally but
     fail to send the response frame. Fail open HTTP waits so browsers do not hang until
     the gateway hour timeout.
+
+    With `websocket`, only requests that were sent over that specific socket are failed.
+    Used when a socket is replaced by a newer one for the same tunnel id: the requests
+    in flight on the old socket can never be answered, but the new socket's requests
+    must be left alone.
     """
-    to_fail = [rid for rid, tid in list(pending_request_tunnels.items()) if tid == tunnel_id]
+    to_fail = [
+        rid
+        for rid, tid in list(pending_request_tunnels.items())
+        if tid == tunnel_id
+        and (websocket is None or pending_request_sockets.get(rid) is websocket)
+    ]
     count = 0
     for rid in to_fail:
         fut = pending_requests.pop(rid, None)
         pending_request_tunnels.pop(rid, None)
+        pending_request_sockets.pop(rid, None)
         if fut and not fut.done():
             fut.set_result(
                 {
@@ -452,6 +470,9 @@ async def _ws_close(
 # handler — that leaves the old receive loop with
 # 'WebSocket is not connected. Need to call "accept" first.'
 tunnel_takeover: dict[int, asyncio.Event] = {}
+# Who owns each live tunnel socket, so a takeover log can name both sides.
+# id(websocket) -> {"device_id": str, "ip": str | None, "since": float}
+tunnel_session_meta: dict[int, dict] = {}
 
 
 def _register_tunnel_session(websocket: WebSocket) -> asyncio.Event:
@@ -2589,10 +2610,30 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
     
     takeover = _register_tunnel_session(websocket)
     old_ws = active_tunnels.get(tunnel_id)
+    new_device = (device_id or "").strip() or "-"
+    tunnel_session_meta[id(websocket)] = {
+        "device_id": new_device,
+        "ip": resolved_ip,
+        "since": time.time(),
+    }
     _claim_active_tunnel(tunnel_id, websocket)
     if old_ws is not None and old_ws is not websocket:
         _signal_tunnel_takeover(old_ws)
-        print(f"⚠️  Replacing existing tunnel: {tunnel_id}")
+        old_meta = tunnel_session_meta.get(id(old_ws), {})
+        old_age = time.time() - old_meta.get("since", time.time())
+        same_device = (
+            old_meta.get("device_id") not in (None, "-") and old_meta.get("device_id") == new_device
+        )
+        print(
+            f"⚠️  Replacing existing tunnel: {tunnel_id} "
+            f"old(device={old_meta.get('device_id', '?')}, ip={old_meta.get('ip', '?')}, age={old_age:.1f}s) "
+            f"-> new(device={new_device}, ip={resolved_ip})"
+            + (
+                " SAME_DEVICE: two EGDesk/egdesk-host processes on one device are dialing this tunnel id"
+                if same_device
+                else ""
+            )
+        )
 
     # Load per-project access flags from mcp_servers.description
     try:
@@ -2778,7 +2819,17 @@ async def tunnel_connect(websocket: WebSocket, name: str = None, device_id: str 
             fail_pending_requests_for_tunnel(tunnel_id)
             print(f"🧹 Cleaned up tunnel: {tunnel_id}")
         else:
-            print(f"🧹 Skipped cleanup for {tunnel_id} — a newer socket owns the name")
+            # A newer socket owns the name, but requests already sent over THIS socket can
+            # never be answered (its client was told to close). Fail them now instead of
+            # leaving visitors hanging until the gateway timeout.
+            failed = fail_pending_requests_for_tunnel(
+                tunnel_id, reason="tunnel_replaced", websocket=websocket
+            )
+            print(
+                f"🧹 Skipped cleanup for {tunnel_id} — a newer socket owns the name "
+                f"(failed {failed} in-flight request(s) from the replaced socket)"
+            )
+        tunnel_session_meta.pop(id(websocket), None)
 
 @app.get("/t/{tunnel_id}/ping")
 async def ping_server(tunnel_id: str, request: Request):
@@ -3982,6 +4033,7 @@ async def _handle_tunnel_request(
         future = asyncio.Future()
         pending_requests[request_id] = future
         pending_request_tunnels[request_id] = tunnel_id
+        pending_request_sockets[request_id] = websocket
 
         try:
             # Send request to client through WebSocket
@@ -4009,6 +4061,7 @@ async def _handle_tunnel_request(
             except asyncio.TimeoutError:
                 pending_requests.pop(request_id, None)
                 pending_request_tunnels.pop(request_id, None)
+                pending_request_sockets.pop(request_id, None)
                 print(
                     f"⏱️ [tunnel-req {request_id}] gateway_timeout "
                     f"after {TUNNEL_REQUEST_TIMEOUT_SECONDS}s tunnel={tunnel_id} path=/{path} "
@@ -4040,6 +4093,7 @@ async def _handle_tunnel_request(
             # Clean up
             pending_requests.pop(request_id, None)
             pending_request_tunnels.pop(request_id, None)
+            pending_request_sockets.pop(request_id, None)
 
             response_bytes = _decode_tunnel_response_body(
                 response_data.get("body"),
@@ -4087,6 +4141,7 @@ async def _handle_tunnel_request(
         except Exception as e:
             pending_requests.pop(request_id, None)
             pending_request_tunnels.pop(request_id, None)
+            pending_request_sockets.pop(request_id, None)
             return JSONResponse(
                 status_code=500,
                 content={"error": str(e)}
